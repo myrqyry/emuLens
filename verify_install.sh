@@ -1,8 +1,8 @@
 #!/bin/bash
-# EmuLensFX Installation Verification Script
+# EmuLens Installation Verification Script
 # Run this after installation to verify the plugin is properly installed
 
-echo "🔍 EmuLensFX Installation Verification"
+echo "🔍 EmuLens Installation Verification"
 echo "======================================"
 
 PLUGIN_DIR="$HOME/.config/obs-studio/plugins/emuLensFX"

@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 Write-Host "================================================" -ForegroundColor Cyan
-Write-Host "  Building EmuLensFX for Windows" -ForegroundColor Cyan
+Write-Host "  Building EmuLens for Windows (emuLensFX module)" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
 
 $InstallPrefix = Join-Path $env:APPDATA "obs-studio\plugins\emuLensFX"

@@ -119,5 +119,5 @@ mv -- "$PREPARED" "$INSTALL_PREFIX"
 PREPARED=""
 SWAPPED=1
 if [[ -n "$BACKUP" ]]; then rm -rf -- "$BACKUP"; fi
-echo "Done. Restart OBS to load the updated EmuLensFX."
+echo "Done. Restart OBS to load the updated EmuLens filter."
 echo "Installed to: $INSTALL_PREFIX"

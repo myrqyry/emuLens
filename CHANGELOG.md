@@ -1,4 +1,24 @@
-# EmuLensFX Changelog
+# EmuLens changelog
+
+## Public source preview — 2026-11-09
+
+- Published **EmuLens v0.5.0** at
+  [myrqyry/emuLens](https://github.com/myrqyry/emuLens), starting from
+  one reviewed source snapshot rather than the full private history.
+- Updated the OBS-facing display name to **EmuLens**. The saved filter
+  ID `emulens_fx`, compiled binary name `emuLensFX` and associated
+  resource/install layout remain unchanged for compatibility.
+- Verified **50 of 51** Linux CTest entries; optional `obspython`
+  integration skipped. Six separate installer-safety tests passed.
+- [Public CI](https://github.com/myrqyry/emuLens/actions/runs/42732888596)
+  succeeded for Linux native rendering, Windows and macOS builds,
+  formatting and Python tests.
+  [OBS 33.0.1 compatibility](https://github.com/myrqyry/emuLens/actions/runs/42732888818)
+  also passed.
+- Independently inspected downloaded Linux, Windows and macOS packages,
+  including their binaries, shader, presets and private-source exclusions.
+  This is an experimental public source preview, not a tagged or
+  signed installer or qualified cross-platform GUI release.
 
 ## [Unreleased]
 
@@ -57,8 +77,9 @@
   Dusty Lens light interaction.
 - Expected per-frame rendering does not emit Bloom entry/exit log spam;
   render-path logging is reserved for actionable failures.
-- The standalone suite contains 49 CTest entries; the optional
-  `PythonIntegrationTest` skips when `obspython` is unavailable.
+- The reviewed public source snapshot has 51 CTest entries. On Linux,
+  50 passed and the optional `PythonIntegrationTest` skipped
+  when `obspython` was unavailable.
 - Release-hardening work adds source archive privacy verification, installer rollback regression tests, a real version banner and separate platform build/artifact checks. This does not constitute Windows/macOS runtime validation.
 
 ## [0.5.0] - 2026-05-12

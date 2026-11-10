@@ -2,6 +2,26 @@
 
 This repository contains a clean source snapshot. Its public Git history is intentionally separate from the private development repository. This checklist documents test boundaries, not cross-platform runtime certification.
 
+## Verified public source checkpoint — 2026-11-09
+
+- Public repository:
+  [myrqyry/emuLens](https://github.com/myrqyry/emuLens), root
+  commit `354c87ac407e29046715b362dfd774d80f7ea82c`.
+- [Main GitHub CI](https://github.com/myrqyry/emuLens/actions/runs/42732888596)
+  succeeded across all five jobs: formatting, Python/installer tests,
+  Linux native/GPU tests and source packaging, Windows and macOS builds.
+- [OBS 33.0.1 compatibility](https://github.com/myrqyry/emuLens/actions/runs/42732888818)
+  passed on Ubuntu 26.04.
+- Linux tests: 51 registered, 50 passed, one optional OBS-Python
+  integration skipped. Six additional installer-safety tests passed.
+- Downloaded and inspected all three public CI packages. Linux contains
+  the ELF `emuLensFX.so`; Windows contains DLLs; macOS contains
+  an unsigned `emuLensFX.plugin`. Each includes the shader and
+  61 presets. The downloaded CPack source archive had 203 verified
+  members with no private diaries or agent files.
+- Not yet qualified: full OBS GUI interactions and long-session streaming
+  performance, plus installed Windows/macOS runtime behavior.
+
 ## Source and privacy
 
 - Public source begins from one reviewed snapshot, not the full development history.

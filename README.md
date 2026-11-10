@@ -5,7 +5,6 @@ Use EmuLens as a source filter to build everything from restrained optical
 imperfections to deliberately stylized analog looks without leaving the OBS
 graphics pipeline.
 
-
 **Public preview source — v0.5.0 (experimental).** All 17 effects, including Wet Lens and Phone Wet Lens, are in this snapshot. Linux has passed isolated OBS/OpenGL tests. Windows and macOS compile/package success does not yet establish that the plugin loads and renders correctly on those platforms. See [CHANGELOG.md](CHANGELOG.md) and [release testing boundaries](docs/RELEASE_CHECKLIST.md).
 
 **Compatibility:** EmuLens is the public project and OBS display name. The internal OBS source ID emulens_fx, binary name emuLensFX, shader resource paths, and installer layout intentionally retain their original names so saved scenes and installations remain compatible. Do not rename the plugin binary or installation directory manually.
@@ -81,6 +80,33 @@ The test suite includes real isolated OBS/OpenGL shader pixel tests
 and complete black-scene darkness), but **not** a live GPU frame-time
 benchmark or aesthetic sign-off for your specific footage.
 
+## Verified GitHub Actions builds
+
+The public [CI workflow](https://github.com/myrqyry/emuLens/actions/workflows/ci.yml)
+builds Linux x86_64, Windows x64 and macOS packages and runs formatting,
+Python checks, installer-safety tests and Linux native/GPU render tests.
+A separate [OBS 33 compatibility workflow](https://github.com/myrqyry/emuLens/actions/workflows/obs33-compatibility.yml)
+checks an OBS 33.0.1 build.
+
+For the public snapshot `354c87a` (November 9, 2026), both
+workflows passed:
+
+- [Main CI: all five jobs passed](https://github.com/myrqyry/emuLens/actions/runs/42732888596).
+  Downloadable artifacts: `emulensfx-linux-obs32`,
+  `emulensfx-windows-obs32` and `emulensfx-macos-obs32`.
+- [OBS 33.0.1 compatibility: passed](https://github.com/myrqyry/emuLens/actions/runs/42732888818).
+
+The packages contain the platform-specific module/bundle,
+`emulens.effect` and all 61 presets; the Linux package also includes
+localization. The downloaded source archive passed the private-file
+exclusion checks. GitHub retains workflow artifacts for a limited time.
+There is no tagged or signed GitHub Release yet.
+
+**Compatibility:** OBS 32.1.0+ is required, but a module compiled
+against a newer libobs SDK may not load in an older OBS installation.
+Windows and macOS packaging success does not establish runtime loading
+or visual correctness on those platforms.
+
 ## Installation
 
 OBS should be closed while replacing the plugin binary. Restart OBS after an
@@ -148,7 +174,7 @@ BUILD_TYPE=RelWithDebInfo ./install_local_macos.sh
 ```
 
 When Homebrew OBS is present, the installer supplies its prefix to CMake
-automatically. The default build type is `RelWithDebInfo` (matches CMake preset default).
+automatically. The installer defaults to `Release`; `BUILD_TYPE=RelWithDebInfo` is optional.
 
 ### Windows
 
@@ -158,7 +184,7 @@ Run from PowerShell:
 .\install_local.ps1
 ```
 
-The default configuration is `RelWithDebInfo`. Supported values are `Debug`,
+The installer defaults to `Release`. Supported values are `Debug`,
 `Release`, `RelWithDebInfo`, and `MinSizeRel`:
 
 ```powershell
@@ -168,13 +194,17 @@ The default configuration is `RelWithDebInfo`. Supported values are `Debug`,
 The user plugin is installed under
 `%APPDATA%\obs-studio\plugins\emuLensFX`.
 
-Platform installation layouts follow OBS plugin conventions; all three platform installers require an explicit install prefix. On Linux, `install_local.sh` builds into a disposable stage, validates the binary/effect/locale, and replaces the old plugin only after preparing a complete replacement with a rollback path. Windows and macOS runtime installation still require platform testing. Restart OBS after installing.
+The installers choose the user-level paths shown above; a custom prefix
+is not needed for a default install. On Linux, `install_local.sh`
+builds into a disposable stage, validates the binary/effect/locale and
+prepares a rollback-safe replacement. Windows and macOS installation
+still needs runtime verification on those platforms. Restart OBS afterward.
 
 ## Usage
 
 1. Add a video or image source to a scene.
 2. Right-click the source → **Filters**.
-3. Click **+** → **emuLensFX**.
+3. Click **+** → **EmuLens**.
 4. Choose an **Effect Type**.
 5. Start from a preset or tune the visible controls directly.
 
@@ -370,11 +400,16 @@ python3 tests/test_mirage_radius_bounds.py
 python3 tests/test_vidicon_reference_model.py
 ```
 
-The test project currently registers 49 CTest entries. On the reviewed Linux setup 48 passed and `PythonIntegrationTest` skipped because `obspython` was not installed. This is not a full GUI/render performance validation. Installer rollback tests run independently with `python3 -m unittest discover -s tests -p test_safe_installer.py -v`.
+The public v0.5.0 snapshot registers **51 CTest entries**. On the
+reviewed Linux environment **50 passed**, including the real Wet Lens
+and Phone Wet Lens GPU render tests. The optional `PythonIntegrationTest`
+skipped because `obspython` was unavailable. These tests do not establish
+sustained stream performance or full GUI behavior. All six installer-safety
+regression tests also passed independently.
 
 ## Architecture
 
-EmuLensFX uses a strategy-per-effect architecture.
+EmuLens uses a strategy-per-effect architecture.
 
 - **Core rendering** (`src/lens-core.c`) — filter lifecycle, settings snapshots,
   shared GPU resources, render dispatch, dimensions, and final composite.
@@ -419,7 +454,7 @@ fixed-in-lens-space contamination.
 
 ## License
 
-EmuLensFX is licensed under the GNU General Public License version 2 or later
+EmuLens is licensed under the GNU General Public License version 2 or later
 (`GPL-2.0-or-later`), matching OBS Studio's licensing. See [LICENSE](LICENSE).
 
 ## Credits

@@ -5,7 +5,7 @@
   "author": "myrqyry",
   "email": "99147786+myrqyry@users.noreply.github.com",
   "website": "https://github.com/myrqyry/emuLens",
-  "description": "High-performance GPU-accelerated cinematic effects: trails, starburst, light leaks, handheld camera, bokeh, particles, Orton, grit, mirage, and vignette effects with thread-safe operation and comprehensive error handling",
+  "description": "Experimental OBS Studio GPU filter with 17 camera, lens and film effects. Retains emuLensFX binary and resource names for compatibility",
   "dependencies": {
     "obs-studio": {
       "version": "32.1.0",

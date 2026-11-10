@@ -5,7 +5,7 @@ BUILD_TYPE="${BUILD_TYPE:-Release}"
 INSTALL_PREFIX="$HOME/Library/Application Support/obs-studio/plugins/emuLensFX"
 
 echo "================================================"
-echo "  Building EmuLensFX for macOS"
+echo "  Building EmuLens for macOS (emuLensFX module)"
 echo "================================================"
 echo "Install prefix: $INSTALL_PREFIX"
 
