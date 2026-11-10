@@ -24,62 +24,6 @@ graphics pipeline.
 - **Filter-chain aware** — renders against the current OBS filter target and
   respects upstream filters such as scaling and cropping.
 
-## Wet Lens: refracted light through water
-
-**Wet Lens** is an independent effect mode, not an option that replaces
-Dusty Lens Bloom. It places seed-deterministic, stationary, curved water beads
-in lens/screen space. Each bead samples the **actual live source image**
-through a spherical-cap-like gradient. Highlights and rim glints are driven
-by captured light, not by a painted rain PNG. The controls provide coverage,
-size, vertical stretch, refraction, captured-light response, edge chromatic
-separation and a persistent pattern seed. Two presets are available:
-**Clean Raindrops** and **Night Window**.
-
-The shader runs as a single OBS GPU pass with the existing per-instance
-noise texture. Setting coverage to zero preserves the original frame.
-It does **not** yet simulate fluid mass, drop merging, runoff, falling
-rain, lens focus stacking or camera-oriented gravity. Static close-up
-beads and distorted streetlights are the current first goal.
-
-A headless OBS/OpenGL (Mesa llvmpipe) test checks actual rendered pixels:
-refraction, captured-light response, small chromatic changes, seeded
-placement and intact alpha. Runtime frame cost and visual quality on the
-user's live camera / GPU are not verified yet. New optical modes are first developed and tested separately;
-installation is a distinct step, never performed over a running OBS.
-
-## Phone Wet Lens: lights refracted through wet camera glass
-
-**Phone Wet Lens** is an independent mode inspired by the large abstract
-water halos and elongated golden light streaks visible in night-time
-smartphone photographs. It does not replace or mutate either Wet Lens
-(beaded water) or Bloom's Dusty Lens preset.
-
-This mode generates a deterministic, irregular distribution of broad
-meniscus regions in lens space, and bends the underlying live video
-through their surface gradients. Separate bright-pass optical layers sample
-actual scene pixels to produce long, direction-adjustable light ribbons,
-illuminated water contours and localized veiling glare. A uniformly dark
-scene cannot generate bright artificial flares. The original alpha channel
-is retained. There are no PNG rain overlays, hidden external assets,
-network dependencies, or time-varying random flicker.
-
-The controls are **Wet Surface Coverage**, **Water Patch Scale**, **Wet
-Contour Strength**, **Broad Refraction**, **Bright-Light Ribbons**,
-**Ribbon Reach**, **Veiling Glow**, **Light Streak Angle** and **Wet
-Surface Pattern**. Start with one of three presets: **Wet Phone Camera**
-(restrained), **Rain on Streetlights** (strong light ribbons), or
-**Heavy Wet Optics** (large contours and refraction). The mode is static
-in lens space; drops do not yet flow, collide or merge.
-
-This is an artistic and physically *inspired* approximation, not a
-validated physical camera model. Close-to-lens contamination and phone
-image processing can both affect the resulting photography; these
-reference images cannot uniquely establish which mechanisms occurred.
-The test suite includes real isolated OBS/OpenGL shader pixel tests
-(refraction, captured-light response, angle, pattern stability, alpha,
-and complete black-scene darkness), but **not** a live GPU frame-time
-benchmark or aesthetic sign-off for your specific footage.
-
 ## Verified GitHub Actions builds
 
 The public [CI workflow](https://github.com/myrqyry/emuLens/actions/workflows/ci.yml)
@@ -317,6 +261,27 @@ instead of producing black wedges from zero valid samples.
 Large particles compensate their energy as size increases and use bounded
 screen-style compositing. Dense overlaps therefore retain visible particle
 structure instead of turning into opaque white blobs.
+
+### Water-on-lens effects
+
+**Wet Lens** uses stationary, seed-deterministic water beads to refract
+the live source image. Captured highlights produce rim glints and subtle
+chromatic separation. Coverage, bead size/stretch, refraction, light
+response, and pattern seed are adjustable; **Clean Raindrops** and
+**Night Window** provide starting points. Zero coverage leaves the frame
+unchanged. It does not simulate flowing or merging droplets.
+
+**Phone Wet Lens** uses broader, irregular wet-surface regions with
+refracted imagery, illuminated contours, veiling glare, and directional
+light ribbons derived from actual source highlights. Controls include
+coverage, patch scale, contour strength, refraction, ribbon strength/reach,
+glow, angle, and pattern. Presets include **Wet Phone Camera**,
+**Rain on Streetlights**, and **Heavy Wet Optics**. The pattern remains
+stationary; a dark source cannot generate bright ribbons on its own.
+
+Both modes have isolated OBS/OpenGL pixel tests, including refraction,
+light response, pattern stability, and alpha handling. These do not
+establish real-time performance for every live scene or GPU.
 
 ## Building
 
