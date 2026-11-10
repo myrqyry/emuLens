@@ -1,0 +1,31 @@
+# EmuLens — public preview verification
+
+This repository contains a clean source snapshot. Its public Git history is intentionally separate from the private development repository. This checklist documents test boundaries, not cross-platform runtime certification.
+
+## Source and privacy
+
+- Public source begins from one reviewed snapshot, not the full development history.
+- Internal diaries, agent instructions, local Meristem state, credentials and generated files are excluded.
+- CI source archives must be checked for private paths before upload.
+- GPL-2.0-or-later licensing is included in LICENSE.
+
+## Build and runtime qualification
+
+- OBS 32.1.0 or newer is required. A plugin built against a newer libobs SDK may not load on an older OBS.
+- Linux CI builds against the pinned OBS SDK, runs its real CTest suite including GPU-pixel tests, and stages the module, shader and 61 presets.
+- Windows and macOS CI compile packages; this is not proof that the plugin loads or renders correctly on a real OBS installation on those platforms.
+- Isolated GPU rendering tests are not sustained stream-performance measurements.
+- Do not install tests into the everyday OBS profile or alter saved scenes.
+- No tagged signed release or OBS plugin-directory listing is implied by publishing source.
+
+## Local verification
+
+    EMULENS_TEST_BUILD_DIR=/tmp/emulensfx-check ./tests/run_tests.sh
+    python3 -m unittest discover -s tests -p test_safe_installer.py -v
+    cmake -S . -B /tmp/emulensfx-build -Dlibobs_DIR=/path/to/libobs/cmake
+    cmake --build /tmp/emulensfx-build
+    cmake --install /tmp/emulensfx-build --prefix /tmp/emulensfx-stage
+    cmake --build /tmp/emulensfx-build --target package_source
+    python3 tests/check_source_archive.py release/emuLensFX-0.5.0-source.tar.xz
+
+CPack archives the working tree rather than only Git-tracked files. Keep source archive exclusions even when .gitignore already covers private files.

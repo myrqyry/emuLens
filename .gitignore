@@ -1,0 +1,81 @@
+# Build directories
+build/
+build-test/
+build_test/
+build_x86_64/
+tests/build/
+tests/__pycache__/
+install/
+release/
+.deps/
+.cache/
+
+# Backup files - should never be committed (use git for version control)
+*.bak
+*.backup
+*.old
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Compiled artifacts
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+
+# Build artifacts
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+compile_commands.json
+cmake/.CMakeBuildNumber
+
+# Log files
+obs_log.txt
+*.log
+
+# Agent/documentation files (not needed in repo)
+repomix-output.*
+repomix-*.md
+genai.md
+libobs-notes-1.txt
+docs/superpowers/
+# Keep Superpowers working files local at any directory depth
+**/superpowers/
+**/.superpowers/
+*.skill
+obs-api-verifier.skill.README.md
+skills-lock.json
+strategy_*.txt
+ui_params.txt
+shader_params.txt
+
+# AI tooling databases
+mcp.db
+
+# Proactive agent personal files
+ONBOARDING.md
+SOUL.md
+USER.md
+MEMORY.md
+SESSION-STATE.md
+HEARTBEAT.md
+TOOLS.md
+memory/
+.grepai/
+
+# meristem:local-ignore:start
+.meristem/local/
+# meristem:local-ignore:end

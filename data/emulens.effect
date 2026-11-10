@@ -1,0 +1,2209 @@
+// Lens Multitool Effect (Full Restore + Fix)
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+// --- COMMON UNIFORMS ---
+/** @brief View-Projection matrix */
+uniform float4x4 ViewProj;
+/** @brief Input texture */
+uniform texture2d image;
+/** @brief History texture for feedback effects */
+uniform texture2d history_image;
+/** @brief Blurred texture for Orton/Bokeh */
+uniform texture2d blurred_image;
+
+/** @brief Time elapsed in seconds */
+uniform float elapsed_time = 0.0;
+/** @brief Blur radius input */
+uniform float val_blur_radius = 0.0;
+
+// Sampling Constants
+#define BOKEH_SAMPLES 32
+#define MAX_SAMPLES 16
+#define MAX_POINTS 16
+
+/** @brief Size of a pixel in UV coordinates */
+uniform float4 uv_pixel_interval = {0.0, 0.0, 0.0, 0.0};
+
+// --- VIDICON UNIFORMS (declared early for ForceUniformUsage) ---
+uniform float vid_decay = 0.88;
+uniform float vid_threshold = 0.70;
+uniform float4 vid_color = {1.0, 1.0, 1.0, 1.0};
+uniform float vid_blend = 0.0;
+uniform float vid_red_lag = 0.06;
+uniform float vid_blue_lag = 0.04;
+uniform float vid_comet = 0.0;
+uniform float vid_comet_length = 4.0;
+uniform float vid_noise = 0.020;
+uniform float vid_beam_pull = 0.015;
+uniform float vid_lag_nonlinear = 0.10;
+uniform float vid_register = 0.06;
+uniform float vid_register_drift = 0.02;
+uniform float vid_scanlines = 0.018;
+
+uniform float vid_gamma = 0.99;
+uniform float vid_smear_enable = 0.0;
+uniform float vid_smear_mode = 0.0;
+uniform float vid_smear_direction = 0.0;
+uniform float vid_smear_strength = 0.0;
+uniform float vid_halation = 0.05;
+uniform float vid_hum = 0.012;
+uniform float vid_source_color = 1.0;
+uniform float hand_vel_dir_x = 0.0;
+uniform float hand_vel_dir_y = 0.0;
+uniform float hand_vel_mag = 0.0;
+uniform float hand_dir_blur_enable = 0.0;
+uniform float hand_blur_directional = 0.0;
+uniform float hand_blur_enable = 0.0;
+uniform float hand_blur_amp = 0.25;
+uniform float hand_blur_speed = 0.20;
+uniform float hand_blur_static = 0.05;
+
+/** @brief Forced uniform persistence to prevent DCE stripping.
+    Uses 1e-6 to make the visual contribution imperceptible on any output. */
+float ForceUniformUsage() {
+    float uniform_guard = 0.0;
+    uniform_guard += elapsed_time * 1e-6;
+    uniform_guard += val_blur_radius * 1e-6;
+    uniform_guard += uv_pixel_interval.x * 1e-6;
+
+    // Vidicon uniforms
+    uniform_guard += vid_decay * 1e-6;
+    uniform_guard += vid_threshold * 1e-6;
+    uniform_guard += vid_color.x * 1e-6;
+    uniform_guard += vid_blend * 1e-6;
+    uniform_guard += vid_red_lag * 1e-6;
+    uniform_guard += vid_blue_lag * 1e-6;
+    uniform_guard += vid_comet * 1e-6;
+    uniform_guard += vid_comet_length * 1e-6;
+    uniform_guard += vid_noise * 1e-6;
+    uniform_guard += vid_beam_pull * 1e-6;
+    uniform_guard += vid_lag_nonlinear * 1e-6;
+    uniform_guard += vid_register * 1e-6;
+    uniform_guard += vid_register_drift * 1e-6;
+    uniform_guard += vid_scanlines * 1e-6;
+
+    uniform_guard += vid_gamma * 1e-6;
+    uniform_guard += vid_smear_enable * 1e-6;
+    uniform_guard += vid_smear_mode * 1e-6;
+    uniform_guard += vid_smear_direction * 1e-6;
+    uniform_guard += vid_smear_strength * 1e-6;
+    uniform_guard += vid_halation * 1e-6;
+    uniform_guard += vid_hum * 1e-6;
+    uniform_guard += vid_source_color * 1e-6;
+    uniform_guard += hand_vel_dir_x * 1e-6;
+    uniform_guard += hand_vel_dir_y * 1e-6;
+    uniform_guard += hand_vel_mag * 1e-6;
+    uniform_guard += hand_dir_blur_enable * 1e-6;
+    uniform_guard += hand_blur_directional * 1e-6;
+    uniform_guard += hand_blur_enable * 1e-6;
+    uniform_guard += hand_blur_amp * 1e-6;
+    uniform_guard += hand_blur_speed * 1e-6;
+    uniform_guard += hand_blur_static * 1e-6;
+
+    return uniform_guard;
+}
+
+/** @brief Force all uniforms into pixel shader computation (not just return) */
+float3 ForceUniformUsageRGB() {
+    float guard = ForceUniformUsage();
+    return float3(guard, guard, guard);
+}
+
+sampler_state textureSampler {
+    Filter    = Linear;
+    AddressU  = Clamp;
+    AddressV  = Clamp;
+    MinLOD    = 0;
+    MaxLOD    = 0;
+};
+
+/** @brief Default Vertex Shader */
+VertData VSDefault(VertData v_in) {
+    VertData vert_out;
+    // Standard OBS transformation
+    vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    vert_out.uv  = v_in.uv;
+    // Force uniform usage in vertex shader where it always executes,
+    // preventing Cg DCE from stripping uniforms on early-return pixel paths
+    vert_out.pos.w += ForceUniformUsage();
+    return vert_out;
+}
+
+// Standard Draw
+float4 PSDraw(VertData v_in) : TARGET {
+    float4 color = image.Sample(textureSampler, v_in.uv);
+    float3 guard = ForceUniformUsageRGB();
+    return float4(color.rgb + guard, color.a);
+}
+
+technique Draw {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSDraw(v_in);
+    }
+}
+
+// Gaussian blur weights adapt to the requested radius while staying normalized
+// by each caller. The radius controls both tap spacing and kernel shape.
+float GetGaussianWeight(int idx) {
+    if (idx < 0) return 0.0;
+    if (idx > 8) return 0.0;
+    float radius = max(0.5, val_blur_radius);
+    float sigma = max(0.5, radius * 0.125);
+    float distance = float(idx);
+    return exp(-(distance * distance) / (2.0 * sigma * sigma));
+}
+
+// --- COMMON HELPERS ---
+
+/** @brief Float-to-int rounding for GL compatibility */
+int f2i(float v) { return int(v + 0.5); }
+
+/** @brief Generates a pseudo-random float from a 2D vector */
+float emu_rand(float2 co) {
+    return frac(sin(dot(co.xy ,float2(12.9898,78.233))) * 43758.5453);
+}
+
+/** @brief 2D Simplex Noise */
+// --- TEXTURE NOISE OPTIMIZATION ---
+uniform texture2d noise_tex;
+sampler_state noiseSampler {
+    Filter    = Linear;
+    AddressU  = Wrap;
+    AddressV  = Wrap;
+    MinLOD    = 0;
+    MaxLOD    = 0;
+};
+
+/** @brief Texture-based Noise Approximation (replaces procedural simplex) */
+float snoise(float2 v) {
+    // Sample a precomputed noise texture instead of doing math
+    // `0.05` is an empirical scalar to roughly match original noise scale
+    return noise_tex.Sample(noiseSampler, v * 0.05).x * 2.0 - 1.0;
+}
+
+/** @brief Legacy Value Noise Wrapper */
+float emu_noise(float2 p) {
+    return snoise(p) * 0.5 + 0.5;
+}
+
+/// =========================================================
+// 1. VIDICON / TRAILS (Enhanced: 3-tube camera simulation)
+// =========================================================
+
+float4 PSVidicon(VertData v_in) : TARGET {
+    float3 guard = ForceUniformUsageRGB();
+    float4 current = image.Sample(textureSampler, v_in.uv);
+
+    // Full-frame tube feedback is intentional. Earlier sparse alpha-only trail
+    // models rendered correctly on black test cards but looked inactive on
+    // ordinary footage because most persistence was discarded before the
+    // composite pass.
+    if (vid_decay < 0.001) {
+        return float4(current.rgb + guard, current.a);
+    }
+
+    float luma = dot(current.rgb, float3(0.299, 0.587, 0.114));
+
+    // Beam pull/comet are optional overload effects. Normal lag needs no
+    // spatial offset: motion creates the trail because old charge remains at
+    // the previous image coordinate.
+    float current_excitation = saturate(
+        (luma - vid_threshold) / max(1.0 - vid_threshold, 0.001));
+    current_excitation =
+        current_excitation * current_excitation *
+        (3.0 - 2.0 * current_excitation);
+
+    float beam_px =
+        vid_beam_pull * current_excitation * luma * luma *
+        80.0 * uv_pixel_interval.x;
+    float comet_px =
+        (vid_comet > 0.5) ? vid_comet_length * uv_pixel_interval.x : 0.0;
+    float2 history_uv = v_in.uv - float2(comet_px + beam_px, 0.0);
+    float4 history = history_image.Sample(textureSampler, history_uv);
+
+    // Bright stored charge can retain slightly longer than the baseline decay.
+    // Threshold therefore shapes highlight persistence without throwing away
+    // the rest of the lagged frame.
+    float history_luma = dot(history.rgb, float3(0.299, 0.587, 0.114));
+    float stored_excitation = saturate(
+        (history_luma - vid_threshold) /
+        max(1.0 - vid_threshold, 0.001));
+    stored_excitation =
+        stored_excitation * stored_excitation *
+        (3.0 - 2.0 * stored_excitation);
+
+    float base_decay = saturate(vid_decay);
+    base_decay = min(
+        1.0,
+        base_decay +
+            vid_lag_nonlinear * stored_excitation *
+            (1.0 - base_decay) * 0.45);
+
+    // Three-tube channel lag is temporal: red retains charge longest, blue can
+    // linger too, but less strongly.
+    float3 channel_decay = float3(
+        min(1.0, base_decay +
+                       vid_red_lag * (1.0 - base_decay) * 1.00),
+        base_decay,
+        min(1.0, base_decay +
+                       vid_blue_lag * (1.0 - base_decay) * 0.65));
+
+    float3 decayed = history.rgb * channel_decay;
+
+    // Color controls affect the retained image, not the clean current frame.
+    float3 tinted = decayed * vid_color.rgb * saturate(vid_color.a);
+    float3 retained = (vid_source_color > 0.5)
+        ? lerp(decayed, tinted, saturate(vid_blend))
+        : tinted;
+
+    // Optional vertical overload smear is injected into the current frame
+    // before feedback replacement. It remains separate from normal tube lag.
+    float3 injected = current.rgb;
+    if (vid_smear_enable > 0.5) {
+        float sm_dir = 1.0 - 2.0 * step(1.5, vid_smear_direction);
+        float3 smear_accum = float3(0.0, 0.0, 0.0);
+        float total_weight = 0.0;
+        for (int i = 1; i <= 8; i++) {
+            float2 sm_uv =
+                v_in.uv + float2(0.0, i * uv_pixel_interval.y * sm_dir);
+            float4 sm_col = image.Sample(textureSampler, sm_uv);
+            float sm_luma = dot(sm_col.rgb, float3(0.299, 0.587, 0.114));
+            float sm_excitation = saturate(
+                (sm_luma - vid_threshold) /
+                max(1.0 - vid_threshold, 0.001));
+            sm_excitation =
+                sm_excitation * sm_excitation *
+                (3.0 - 2.0 * sm_excitation);
+            float w = sm_excitation * (1.0 - float(i) / 9.0);
+            smear_accum += sm_col.rgb * w;
+            total_weight += w;
+        }
+        if (total_weight > 0.001) {
+            float3 smear_signal =
+                (smear_accum / total_weight) * vid_smear_strength;
+            injected = max(injected, smear_signal);
+        }
+    }
+
+    // The old working Vidicon used replacement/max full-frame feedback. A
+    // static source therefore does not pump exposure, while motion exposes the
+    // brighter decaying image left at previous coordinates.
+    float3 feedback_rgb = max(injected, retained);
+
+    float n = snoise(v_in.uv * 500.0 + elapsed_time * 20.0);
+    feedback_rgb += n * vid_noise * 0.02;
+    feedback_rgb =
+        saturate(max(float3(0.0, 0.0, 0.0), feedback_rgb));
+
+    return float4(feedback_rgb + guard, current.a);
+}
+
+float4 PSVidiconComposite(VertData v_in) : TARGET {
+    float4 original = image.Sample(textureSampler, v_in.uv);
+    float4 feedback = history_image.Sample(textureSampler, v_in.uv);
+
+    // Halation is driven by persistence that rises above the current frame,
+    // not by the whole feedback image, so normal midtones do not become a veil.
+    if (vid_halation > 0.001) {
+        float3 residual =
+            max(float3(0.0, 0.0, 0.0), feedback.rgb - original.rgb);
+        float2 off = uv_pixel_interval.xy * 2.0;
+        float3 halo_sum = residual;
+        float w_sum = 1.0;
+        for (int ky = -1; ky <= 1; ky++) {
+            for (int kx = -1; kx <= 1; kx++) {
+                if (kx == 0 && ky == 0) continue;
+                float2 tap_uv =
+                    v_in.uv + float2(kx * off.x, ky * off.y);
+                float3 hist_tap =
+                    history_image.Sample(textureSampler, tap_uv).rgb;
+                float3 cur_tap =
+                    image.Sample(textureSampler, tap_uv).rgb;
+                float3 tap_residual =
+                    max(float3(0.0, 0.0, 0.0), hist_tap - cur_tap);
+                float tap_luma =
+                    dot(tap_residual, float3(0.299, 0.587, 0.114));
+                float tw = saturate(tap_luma * 2.0);
+                halo_sum += tap_residual * tw;
+                w_sum += tw;
+            }
+        }
+        float3 halo =
+            halo_sum / max(w_sum, 0.001);
+        feedback.rgb += halo * vid_halation;
+    }
+
+    // Time-varying three-tube registration error applies to the lagged frame.
+    float drift_t = elapsed_time * vid_register_drift * 0.05;
+    float2 reg_px = vid_register * uv_pixel_interval.xy;
+    float2 drift_r =
+        reg_px * float2(sin(drift_t + 0.0), cos(drift_t + 1.0));
+    float2 drift_g =
+        reg_px * float2(sin(drift_t + 0.7), cos(drift_t + 0.9));
+    float2 drift_b =
+        reg_px * float2(sin(drift_t + 1.1), cos(drift_t + 1.7));
+
+    float4 trail_r =
+        history_image.Sample(textureSampler, v_in.uv + drift_r);
+    float4 trail_g =
+        history_image.Sample(textureSampler, v_in.uv + drift_g);
+    float4 trail_b =
+        history_image.Sample(textureSampler, v_in.uv + drift_b);
+
+    float3 registered =
+        float3(trail_r.r, trail_g.g, trail_b.b);
+
+    // Present the full feedback frame generated in pass 1. This is the
+    // critical pre-churn behavior: persistence must not be reduced to a sparse
+    // mask and then compared against the current frame a second time.
+    float3 final_rgb =
+        lerp(feedback.rgb, registered, saturate(vid_register));
+
+    float hum_phase =
+        elapsed_time * 3.14159 * 0.6 + v_in.uv.y * 3.14159 * 4.0;
+    float hum = 1.0 + vid_hum * 0.04 * sin(hum_phase);
+    final_rgb *= hum;
+
+    float gamma_exp = 1.0 / max(vid_gamma, 0.01);
+    final_rgb = float3(
+        pow(max(final_rgb.r, 0.0), gamma_exp),
+        pow(max(final_rgb.g, 0.0), gamma_exp),
+        pow(max(final_rgb.b, 0.0), gamma_exp)
+    );
+
+    float height_px = 1.0 / uv_pixel_interval.y;
+    float scan =
+        1.0 - vid_scanlines * 0.5 *
+                  (0.5 + 0.5 *
+                             cos(v_in.uv.y * height_px * 6.28318));
+    final_rgb *= scan;
+
+    float3 guard = ForceUniformUsageRGB();
+    return float4(saturate(final_rgb) + guard, original.a);
+}
+
+technique DrawVidicon {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSVidicon(v_in);
+    }
+}
+
+technique DrawVidiconComposite {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSVidiconComposite(v_in);
+    }
+}
+
+// =========================================================
+// 2. STARBURST
+// =========================================================
+uniform float sb_threshold = 0.84;
+uniform float sb_intensity = 0.65;
+uniform float sb_points = 6.0;
+uniform float sb_ray_length = 0.16;
+uniform float sb_thickness = 0.9;
+uniform float sb_smoothness = 4.5;
+uniform float sb_colorize = 0.0;
+uniform float4 sb_color = {1.0, 1.0, 1.0, 1.0};
+uniform float sb_chroma = 0.02;
+uniform float sb_rot_speed = 0.0;
+uniform float sb_rotation = 0.0;
+uniform float sb_pulse_speed = 0.18;
+uniform float sb_pulse_amp = 0.0;
+uniform float sb_samples = 12.0;
+uniform float sb_anamorphic = 0.0;
+uniform float sb_blend_mode = 1.0;
+
+float4 PSStarburst(VertData v_in) : TARGET {
+    float4 original = image.Sample(textureSampler, v_in.uv);
+    float rot = (sb_rotation * 0.01745329252) + sb_rot_speed * elapsed_time;
+
+    float pulse = 0.0;
+    if (sb_pulse_amp > 0.0) {
+        pulse = (sin(elapsed_time * sb_pulse_speed) * 0.5 + 0.5) * sb_pulse_amp;
+    }
+    float current_ray_len = sb_ray_length * (1.0 + pulse);
+    float total_accum = 0.0;
+
+    int points = f2i(sb_points);
+    if (points < 2) points = 2;
+    if (points > MAX_POINTS) points = MAX_POINTS;
+
+    int samples = f2i(sb_samples);
+    if (samples < 4) samples = 4;
+    if (samples > MAX_SAMPLES) samples = MAX_SAMPLES;
+
+    float aspect = (uv_pixel_interval.x != 0.0) ? (uv_pixel_interval.y / uv_pixel_interval.x) : 1.0;
+
+    for (int i = 0; i < MAX_POINTS; i++) {
+        if (i >= points) break;
+
+        float angle = (6.2831853 / float(points)) * float(i) + rot;
+        float2 dir = float2(cos(angle) / aspect, sin(angle));
+        if (sb_anamorphic > 0.5) dir.y *= 0.5;
+
+        float ray_accum = 0.0;
+        for (int j = 1; j <= MAX_SAMPLES; j++) {
+            if (j > samples) break;
+            float scale = float(j) / float(samples);
+            float2 sample_pos = v_in.uv - dir * current_ray_len * scale;
+            if (sample_pos.x < 0.0 || sample_pos.x > 1.0 || sample_pos.y < 0.0 || sample_pos.y > 1.0) continue;
+
+            float4 samp = image.Sample(textureSampler, sample_pos);
+            float samp_luma = dot(samp.rgb, float3(0.299, 0.587, 0.114));
+            float2 perp = normalize(float2(-dir.y, dir.x));
+            float2 width_offset = perp * sb_thickness * float2(uv_pixel_interval.x, uv_pixel_interval.y);
+            float2 width_pos = sample_pos + width_offset;
+            if (width_pos.x >= 0.0 && width_pos.x <= 1.0 && width_pos.y >= 0.0 && width_pos.y <= 1.0) {
+                samp_luma = max(samp_luma, dot(image.Sample(textureSampler, width_pos).rgb, float3(0.299, 0.587, 0.114)));
+            }
+            width_pos = sample_pos - width_offset;
+            if (width_pos.x >= 0.0 && width_pos.x <= 1.0 && width_pos.y >= 0.0 && width_pos.y <= 1.0) {
+                samp_luma = max(samp_luma, dot(image.Sample(textureSampler, width_pos).rgb, float3(0.299, 0.587, 0.114)));
+            }
+            // Real star filters produce longer/brighter rays from stronger
+            // point highlights. Do not lower the threshold with distance:
+            // that lets weak sources smear farther than bright ones.
+            float excess = saturate(
+                (samp_luma - sb_threshold) / max(1.0 - sb_threshold, 0.001));
+            float reach = pow(excess, 0.60);
+            float reach_fade =
+                1.0 - smoothstep(reach, reach + 0.10, scale);
+            float distance_falloff =
+                pow(max(0.0, 1.0 - scale), max(0.5, sb_smoothness * 0.55));
+            ray_accum += excess * reach_fade * distance_falloff;
+        }
+        total_accum += ray_accum / float(samples);
+    }
+
+    total_accum = saturate(total_accum / (sqrt(float(points)) * 0.5 + 0.1));
+    float mix_factor = total_accum * sb_intensity;
+
+    float3 final_rgb = original.rgb;
+    if (mix_factor > 0.001) {
+        float3 ray_rgb = float3(1.0, 1.0, 1.0);
+        if (sb_chroma > 0.0 && sb_colorize < 0.5) {
+             float chroma_dist = sb_chroma * 0.02 * mix_factor;
+             float2 to_pixel = v_in.uv - 0.5;
+             float r = image.Sample(textureSampler, v_in.uv - to_pixel * chroma_dist).r;
+             float g = image.Sample(textureSampler, v_in.uv).g;
+             float b = image.Sample(textureSampler, v_in.uv + to_pixel * chroma_dist).b;
+             ray_rgb = float3(r, g, b);
+        } else if (sb_colorize > 0.5) {
+            ray_rgb = sb_color.rgb;
+        }
+
+        float3 star_layer = ray_rgb * mix_factor;
+
+        int sb_blend = f2i(sb_blend_mode);
+        if (sb_blend == 0) final_rgb = original.rgb + star_layer;
+        else if (sb_blend == 1) final_rgb = 1.0 - (1.0 - original.rgb) * (1.0 - star_layer);
+        else {
+            float3 check = step(0.5, original.rgb);
+            final_rgb = lerp(2.0 * original.rgb * star_layer, 1.0 - 2.0 * (1.0 - original.rgb) * (1.0 - star_layer), check);
+        }
+    }
+
+    float3 guard = ForceUniformUsageRGB();
+    float4 result = float4(final_rgb, original.a);
+    return float4(result.rgb + guard, result.a);
+}
+
+technique DrawStarburst {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSStarburst(v_in);
+    }
+}
+
+// =========================================================
+// 3. LIGHT LEAK
+// =========================================================
+uniform float leak_intensity = 0.55;
+uniform float leak_speed = 0.04;
+uniform float leak_scale = 1.4;
+uniform float4 leak_color = {1.0, 0.5333, 0.2667, 1.0};
+uniform float leak_color_enable_shift = 0.0;
+uniform float4 leak_color_shift = {1.0, 1.0, 1.0, 1.0};
+uniform float leak_color_speed = 0.02;
+uniform float leak_bias_top = 0.15;
+uniform float leak_bias_bot = 0.10;
+uniform float leak_bias_left = 0.75;
+uniform float leak_bias_right = 0.05;
+uniform float leak_edge_falloff = 4.5;
+uniform float leak_streakiness = 0.75;
+uniform float leak_contrast = 1.35;
+uniform float leak_complexity = 3.0;
+uniform float leak_blend_mode = 2.0;
+
+float warp_fbm(float2 p, int octaves) {
+    float total = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    float2 shift = float2(100.0, 100.0);
+    float c = cos(0.5);
+    float s = sin(0.5);
+
+    float2 q = float2(0.0, 0.0);
+    q.x = snoise(p);
+    q.y = snoise(p + float2(5.2, 1.3));
+
+    float2 r = float2(0.0, 0.0);
+    r.x = snoise(p + 1.0*q + float2(1.7, 9.2));
+    r.y = snoise(p + 1.0*q + float2(8.3, 2.8));
+
+    float2 warped_p = p + r;
+
+    for(int i = 0; i < 8; i++) {
+        if (i >= octaves) break;
+        total += snoise(warped_p * freq) * amp;
+        float nx = warped_p.x * c - warped_p.y * s;
+        float ny = warped_p.x * s + warped_p.y * c;
+        warped_p = float2(nx, ny) * 2.0 + shift;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    return total;
+}
+
+float4 PSLightLeak(VertData v_in) : TARGET {
+    float4 original = image.Sample(textureSampler, v_in.uv);
+    float2 uv = v_in.uv;
+    float mask = 0.0;
+
+    // Bias masks
+    mask += pow(1.0 - uv.y, leak_edge_falloff) * leak_bias_top;
+    mask += pow(uv.y, leak_edge_falloff) * leak_bias_bot;
+    mask += pow(1.0 - uv.x, leak_edge_falloff) * leak_bias_left;
+    mask += pow(uv.x, leak_edge_falloff) * leak_bias_right;
+
+    // Always execute expensive path (no early return) to keep uniform refs alive.
+    // When mask is near zero, the leak_val will be ~0 and result ≈ original.
+    mask = max(mask, 0.002);
+
+    float2 noise_uv = uv * leak_scale;
+    noise_uv.x += elapsed_time * leak_speed;
+    if (leak_streakiness > 1.01) noise_uv.x /= leak_streakiness;
+    else if (leak_streakiness < 0.99) noise_uv.y /= leak_streakiness;
+
+    float leak_val = warp_fbm(noise_uv, f2i(leak_complexity));
+    leak_val = saturate(leak_val * leak_intensity * mask);
+    leak_val = pow(leak_val, max(0.1, 1.0 / leak_contrast));
+
+    float3 col_base = leak_color.rgb;
+    if (leak_color_enable_shift > 0.5) {
+        float3 shift_rgb = leak_color_shift.rgb;
+        float t = elapsed_time * leak_color_speed;
+        col_base = lerp(col_base, shift_rgb, sin(t) * 0.5 + 0.5);
+    }
+
+    float3 final_rgb_leak;
+    if (leak_val < 0.5) final_rgb_leak = lerp(float3(0,0,0), col_base, leak_val * 2.0);
+    else final_rgb_leak = lerp(col_base, float3(1,1,1), (leak_val - 0.5) * 2.0);
+
+    float3 final_rgb;
+    int leak_blend = f2i(leak_blend_mode);
+    if (leak_blend == 0) final_rgb = original.rgb + final_rgb_leak;
+    else if (leak_blend == 1) final_rgb = 1.0 - (1.0 - original.rgb) * (1.0 - final_rgb_leak);
+    else final_rgb = lerp(original.rgb, final_rgb_leak, leak_val);
+
+    float3 guard = ForceUniformUsageRGB();
+    float4 result = float4(final_rgb, original.a);
+    return float4(result.rgb + guard, result.a);
+}
+
+technique DrawLightLeak {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSLightLeak(v_in);
+    }
+}
+
+// =========================================================
+// 4. GAUSSIAN BLUR
+// =========================================================
+float4 PSGaussianH(VertData v_in) : TARGET {
+    float2 texel = float2(uv_pixel_interval.x, uv_pixel_interval.y);
+    float r = max(0.0, val_blur_radius);
+    float total_weight = GetGaussianWeight(0);
+    float4 col = image.Sample(textureSampler, v_in.uv) * total_weight;
+    for (int i = 1; i <= 8; i++) {
+        float weight = GetGaussianWeight(i);
+        if (weight < 0.0001) break;
+        float2 offset = float2(float(i) * texel.x * r, 0.0);
+        col += image.Sample(textureSampler, v_in.uv + offset) * weight;
+        col += image.Sample(textureSampler, v_in.uv - offset) * weight;
+        total_weight += weight * 2.0;
+    }
+    float4 result = col / total_weight;
+    float3 guard = ForceUniformUsageRGB();
+    return float4(result.rgb + guard, result.a);
+}
+
+float4 PSGaussianV(VertData v_in) : TARGET {
+    float2 texel = float2(uv_pixel_interval.x, uv_pixel_interval.y);
+    float r = max(0.0, val_blur_radius);
+    float total_weight = GetGaussianWeight(0);
+    float4 col = image.Sample(textureSampler, v_in.uv) * total_weight;
+    for (int i = 1; i <= 8; i++) {
+        float weight = GetGaussianWeight(i);
+        if (weight < 0.0001) break;
+        float2 offset = float2(0.0, float(i) * texel.y * r);
+        col += image.Sample(textureSampler, v_in.uv + offset) * weight;
+        col += image.Sample(textureSampler, v_in.uv - offset) * weight;
+        total_weight += weight * 2.0;
+    }
+    float4 result = col / total_weight;
+    float3 guard = ForceUniformUsageRGB();
+    return float4(result.rgb + guard, result.a);
+}
+
+technique DrawGaussianH {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSGaussianH(v_in);
+    }
+}
+
+technique DrawGaussianV {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSGaussianV(v_in);
+    }
+}
+
+// =========================================================
+// HANDHELD
+// =========================================================
+uniform float hand_pos_amp = 0.0035;
+uniform float hand_pos_speed = 0.16;
+uniform float hand_rot_amp = 0.22;
+uniform float hand_rot_speed = 0.12;
+uniform float hand_zoom_amp = 0.004;
+uniform float hand_zoom_speed = 0.10;
+uniform float2 hand_pos_offset = {0.0, 0.0};
+uniform float hand_rot_rad = 0.0;
+uniform float hand_zoom_factor = 1.0;
+uniform float hand_feather = 0.04;
+
+float4 PSHandheld(VertData v_in) : TARGET {
+    float aspect = (uv_pixel_interval.x != 0.0) ? (uv_pixel_interval.y / uv_pixel_interval.x) : 1.0;
+
+    float2 uv = v_in.uv - 0.5;
+    uv /= hand_zoom_factor;
+    uv.x *= aspect;
+    float s = sin(hand_rot_rad), c = cos(hand_rot_rad);
+    uv = float2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
+    uv.x /= aspect;
+    uv += 0.5 + hand_pos_offset;
+
+    float4 final_color = float4(0.0, 0.0, 0.0, 0.0);
+    float r = max(0.0, val_blur_radius);
+
+    if (r < 0.01) {
+        final_color = image.Sample(textureSampler, uv);
+    } else {
+        float2 texel = float2(uv_pixel_interval.x, uv_pixel_interval.y);
+        float total_weight = GetGaussianWeight(0);
+        final_color = image.Sample(textureSampler, uv) * total_weight;
+        for (int i = 1; i <= 4; i++) {
+            float weight = GetGaussianWeight(i);
+            float2 h_offset = float2(float(i) * texel.x * r, 0.0);
+            float2 v_offset = float2(0.0, float(i) * texel.y * r);
+            final_color += image.Sample(textureSampler, uv + h_offset) * weight;
+            final_color += image.Sample(textureSampler, uv - h_offset) * weight;
+            final_color += image.Sample(textureSampler, uv + v_offset) * weight;
+            final_color += image.Sample(textureSampler, uv - v_offset) * weight;
+            total_weight += weight * 4.0;
+        }
+        final_color /= total_weight;
+    }
+
+    if (hand_feather > 0.0) {
+        float f = hand_feather;
+        float mask_x = smoothstep(0.0, f, v_in.uv.x) * smoothstep(0.0, f, 1.0 - v_in.uv.x);
+        float mask_y = smoothstep(0.0, f, v_in.uv.y) * smoothstep(0.0, f, 1.0 - v_in.uv.y);
+        final_color.rgb *= (mask_x * mask_y);
+    }
+
+    // ── Handheld shake / motion blur ──
+    // Static component + velocity-scaled shake. When directional blur is
+    // enabled and a velocity vector exists, the blur smears along that
+    // direction; otherwise it wobbles radially.
+    if (hand_blur_enable > 0.5) {
+        float shake = 0.5 + 0.5 * sin(elapsed_time * hand_blur_speed * 6.2831853);
+        float blur_px = hand_blur_static + hand_blur_amp * hand_vel_mag * shake;
+        float2 vel = float2(hand_vel_dir_x, hand_vel_dir_y);
+        float vel_len = length(vel);
+
+        if (hand_dir_blur_enable > 0.5 && hand_blur_directional > 0.5 && vel_len > 0.001) {
+            float2 dir = vel / vel_len;
+            float2 step = dir * blur_px * uv_pixel_interval.xy;
+            float4 d_accum = image.Sample(textureSampler, uv);
+            float d_wsum = 1.0;
+            for (int i = 1; i <= 8; i++) {
+                float w = 1.0 - float(i) / 9.0;
+                float2 off = step * float(i);
+                d_accum += image.Sample(textureSampler, uv + off) * w;
+                d_accum += image.Sample(textureSampler, uv - off) * w;
+                d_wsum += w * 2.0;
+            }
+            final_color = d_accum / d_wsum;
+        } else if (blur_px > 0.01) {
+            // Radial wobble blur
+            float4 r_accum = image.Sample(textureSampler, uv);
+            float r_wsum = 1.0;
+            for (int i = 1; i <= 6; i++) {
+                float w = 1.0 - float(i) / 7.0;
+                float a = elapsed_time * 3.0 + float(i) * 1.1;
+                float2 off = float2(cos(a), sin(a)) * blur_px * uv_pixel_interval.xy;
+                r_accum += image.Sample(textureSampler, uv + off) * w;
+                r_accum += image.Sample(textureSampler, uv - off) * w;
+                r_wsum += w * 2.0;
+            }
+            final_color = r_accum / r_wsum;
+        }
+    }
+
+    float3 guard = ForceUniformUsageRGB();
+    return float4(final_color.rgb + guard, final_color.a);
+}
+
+technique DrawHandheld {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSHandheld(v_in);
+    }
+}
+
+// =========================================================
+// 5. BOKEH
+// =========================================================
+uniform float bokeh_radius = 7.0;
+uniform float bokeh_shape = 0.0;
+uniform float bokeh_power = 1.6;
+uniform float bokeh_focus_x = 0.5;
+uniform float bokeh_focus_y = 0.5;
+uniform float bokeh_width = 0.3;
+uniform float bokeh_falloff = 0.28;
+uniform float bokeh_boost = 3.5;
+uniform float bokeh_high_response = 0.0;
+uniform float bokeh_threshold = 0.70;
+
+float4 PSBokeh(VertData v_in) : TARGET {
+    float4 original = image.Sample(textureSampler, v_in.uv);
+    float2 focus = float2(bokeh_focus_x, bokeh_focus_y);
+    float dist = length(v_in.uv - focus);
+    float blur_factor = smoothstep(bokeh_width, bokeh_width + bokeh_falloff, dist);
+
+    if (blur_factor <= 0.01 || bokeh_radius <= 0.0) {
+        float3 guard = ForceUniformUsageRGB();
+        float4 ret = original;
+        return float4(ret.rgb + guard, ret.a);
+    }
+
+    float r = blur_factor * bokeh_radius;
+    float4 accum = float4(0,0,0,0);
+    float total_w = 0.0;
+
+    // Always BOKEH_SAMPLES here (early return handles the zero case)
+    const int sample_count = BOKEH_SAMPLES;
+
+    for (int i = 0; i < BOKEH_SAMPLES; i++) {
+        if (i >= sample_count) break;
+        float t = float(i) / float(BOKEH_SAMPLES);
+        float angle = t * 6.2831853;
+
+        float r_mult = 1.0;
+        int sides = f2i(bokeh_shape);
+        if (sides >= 3) {
+            float b = 6.2831853 / float(sides);
+            float a_mod = angle - b * floor(angle / b + 0.5);
+            r_mult = cos(b * 0.5) / cos(a_mod);
+        }
+
+        float2 dir = float2(cos(angle), sin(angle));
+        float2 offset = dir * r * r_mult * uv_pixel_interval.xy * sqrt(t);
+
+        float4 samp = image.Sample(textureSampler, v_in.uv + offset);
+        float luma = dot(samp.rgb, float3(0.299, 0.587, 0.114));
+
+        float weight = 1.0 + pow(max(0.0, luma), max(1.0, bokeh_power)) * max(1.0, bokeh_boost);
+        if (bokeh_high_response > 0.5 && luma < bokeh_threshold) weight *= 0.1;
+
+        accum += samp * weight;
+        total_w += weight;
+    }
+
+    float3 result = (total_w > 0.0) ? accum.rgb / total_w : original.rgb;
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(result, original.a);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+technique DrawBokeh {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSBokeh(v_in);
+    }
+}
+
+// =========================================================
+// 6. PARTICLES
+// =========================================================
+uniform float part_density = 18.0;
+uniform float part_size = 0.004;
+uniform float part_size_var = 0.55;
+uniform float part_speed = 0.25;
+uniform float part_wind_x = 0.02;
+uniform float part_wind_y = -0.01;
+uniform float part_wobble = 0.16;
+uniform float4 part_color_start = {1.0, 1.0, 1.0, 0.4};
+uniform float4 part_color_end = {1.0, 1.0, 1.0, 0.0941};
+uniform float part_source_color = 0.0;
+uniform float part_source_influence = 0.0;
+uniform float part_source_brightness = 0.0;
+uniform float part_source_threshold = 0.70;
+uniform float part_source_strength = 1.0;
+uniform float part_focus_x = 0.5;
+uniform float part_focus_y = 0.5;
+uniform float part_focus_strength = 0.0;
+uniform float part_blur_edge = 0.65;
+uniform float part_use_poly = 0.0;
+uniform float part_poly_sides = 6.0;
+uniform float part_poly_rot = 0.0;
+uniform float part_poly_rot_speed = 0.0;
+uniform float part_ca_strength = 0.0;
+
+float sdPoly(float2 p, float r, int sides, float rot) {
+    float a = atan2(p.x, p.y) + rot;
+    float b = 6.2831853 / float(sides);
+    return cos(floor(0.5 + a/b)*b - a) * length(p) - r;
+}
+
+float4 PSBokehParticles(VertData v_in) : TARGET {
+    float4 original = image.Sample(textureSampler, v_in.uv);
+    float3 accum = float3(0,0,0);
+    float2 focus = float2(part_focus_x, part_focus_y);
+    float aspect = (uv_pixel_interval.x != 0.0) ? (uv_pixel_interval.y / uv_pixel_interval.x) : 1.0;
+
+    // Sample the moving lattice, not stationary cells. Otherwise strong wind
+    // moves particles beyond the fixed neighbor search and they pop out.
+    float part_time = elapsed_time * part_speed;
+    float2 wind_offset = frac(float2(part_wind_x, part_wind_y) * part_time * 0.1);
+    float2 lookup_uv = frac(v_in.uv - wind_offset);
+
+    for (int y = -3; y <= 3; y++) {
+        for (int x = -3; x <= 3; x++) {
+            float2 grid = floor(lookup_uv * part_density + float2(float(x), float(y)));
+            float2 rand_seed = grid / part_density;
+            float r1 = emu_rand(rand_seed);
+            float r2 = emu_rand(rand_seed + 0.543);
+
+            float2 pos = (grid + float2(r1, r2)) / part_density;
+            pos += wind_offset;
+            pos.x += sin(part_time * 0.8 + r1 * 10.0) * part_wobble * 0.01;
+            pos.y += cos(part_time * 0.9 + r2 * 10.0) * part_wobble * 0.01;
+
+            pos = frac(pos);
+            float2 particle_delta = abs(v_in.uv - pos);
+            particle_delta = min(particle_delta, 1.0 - particle_delta);
+            float dist = length(particle_delta * float2(aspect, 1.0));
+            float size = part_size * (1.0 + (r1 - 0.5) * part_size_var);
+
+            float focus_dist = length(pos - focus);
+            size *= 1.0 + focus_dist * part_focus_strength;
+
+            if (dist < size) {
+                float mask;
+                float3 p_col = lerp(part_color_start.rgb, part_color_end.rgb, r1);
+                float alpha = part_color_start.a + r2 * (part_color_end.a - part_color_start.a);
+
+                // Preserve roughly consistent visual energy as particles grow.
+                // Without this, increasing part_size increases covered area while
+                // keeping per-pixel alpha unchanged, so overlapping large motes
+                // collapse into an opaque white cloud.
+                float size_energy = sqrt(min(1.0, 0.004 / max(size, 0.004)));
+                alpha *= size_energy;
+
+                if (part_use_poly > 0.5) {
+                    float poly_angle = part_poly_rot * 0.01745329252 + part_poly_rot_speed * elapsed_time;
+                    float2 local_p = (v_in.uv - pos) * float2(aspect, 1.0);
+                    float poly_dist = sdPoly(local_p, size * 0.5, f2i(part_poly_sides), poly_angle);
+                    mask = 1.0 - smoothstep(size * (1.0 - part_blur_edge) * 0.5, size * 0.5, poly_dist);
+                } else {
+                    mask = 1.0 - smoothstep(size * (1.0 - part_blur_edge), size, dist);
+                }
+
+                if (part_source_brightness > 0.5 || part_source_color > 0.5) {
+                    float3 src = image.Sample(textureSampler, pos).rgb;
+                    if (part_source_color > 0.5) {
+                        p_col = lerp(p_col, src, part_source_influence);
+                    }
+
+                    if (part_source_brightness > 0.5) {
+                        float src_luma = dot(src, float3(0.299, 0.587, 0.114));
+                        float bright_boost = saturate((src_luma - part_source_threshold) * part_source_strength);
+                        alpha *= 1.0 + bright_boost;
+                    }
+                }
+
+                accum += p_col * mask * alpha;
+
+                // Chromatic aberration on accumulated particle
+                if (part_ca_strength > 0.001) {
+                    float2 ca_offset = (pos - 0.5) * part_ca_strength * 0.005;
+                    float r_shift = image.Sample(textureSampler, v_in.uv + ca_offset).r;
+                    float b_shift = image.Sample(textureSampler, v_in.uv - ca_offset).b;
+                    accum.r += r_shift * mask * alpha * part_ca_strength * 0.3;
+                    accum.b += b_shift * mask * alpha * part_ca_strength * 0.3;
+                }
+            }
+        }
+    }
+
+    float3 guard = ForceUniformUsageRGB();
+    // Screen-composite the particle light instead of clipping an unbounded
+    // additive sum. Individual particles remain luminous, but large/overlapping
+    // sprites retain separation instead of turning into a flat white sheet.
+    float3 particle_layer = saturate(accum);
+    float3 final_rgb = 1.0 - (1.0 - original.rgb) * (1.0 - particle_layer);
+    return float4(final_rgb + guard, original.a);
+}
+
+technique DrawBokehParticles {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSBokehParticles(v_in);
+    }
+}
+
+// =========================================================
+// 7. ORTON
+// =========================================================
+uniform float orton_opacity = 0.22;
+uniform float orton_contrast = 1.03;
+uniform float orton_brightness = -0.03;
+uniform float orton_saturation = 1.02;
+uniform float orton_blend_mode = 1.0;
+uniform float orton_highlight_boost = 0.22;
+
+float4 PSOrton(VertData v_in) : TARGET {
+    float4 sharp = image.Sample(textureSampler, v_in.uv);
+    float4 blurred = blurred_image.Sample(textureSampler, v_in.uv);
+
+    float3 col = sharp.rgb;
+    float3 blr = blurred.rgb;
+
+    // Highlight boost - use simple multiplication instead of pow to avoid NaNs
+    float luma_blr = dot(blr, float3(0.299, 0.587, 0.114));
+    blr *= 1.0 + (luma_blr * luma_blr * luma_blr) * orton_highlight_boost;
+
+    // Blend
+    int orton_blend = f2i(orton_blend_mode);
+    float3 blended;
+    if (orton_blend == 0)      blended = col + (blr * orton_opacity);
+    else if (orton_blend == 1) blended = 1.0 - (1.0 - col) * (1.0 - saturate(blr * orton_opacity));
+    else                       blended = lerp(col, blr, saturate(orton_opacity));
+
+    // Adjustments
+    float3 result = blended + orton_brightness;
+
+    // Contrast (Safe formula: identity at 1.0, neutral grey floor)
+    float contrast_val = max(0.01, orton_contrast);
+    result = (result - 0.5) * contrast_val + 0.5;
+
+    // Saturation (Safe formula)
+    float sat_val = max(0.0, orton_saturation);
+    float gray = dot(result, float3(0.299, 0.587, 0.114));
+    result = lerp(float3(gray, gray, gray), result, sat_val);
+
+    // FINAL SAFETY: ensure we return valid color only
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(saturate(result), sharp.a);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+technique DrawOrton {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSOrton(v_in);
+    }
+}
+
+// =========================================================
+// 8. BLOOM / GLOW
+// =========================================================
+uniform float bloom_threshold = 0.72;
+uniform float bloom_intensity = 0.60;
+uniform float bloom_radius = 18.0;
+uniform float bloom_softness = 0.24;
+uniform float bloom_dust_amount = 0.02;
+uniform float bloom_dust_scale = 12.0;
+uniform float bloom_haze_amount = 0.025;
+uniform float bloom_dust_contrast = 1.0;
+uniform float bloom_refract_amount = 0.0;
+uniform float bloom_refract_scale = 1.5;
+uniform float bloom_highlights_only = 0.0;
+uniform float bloom_anamorphic = 0.0;
+uniform float4 bloom_color = {1.0, 1.0, 1.0, 1.0};
+uniform float bloom_dust_specular = 0.20;
+uniform float bloom_dust_depth_layers = 2.0;
+uniform float bloom_ghost_amount = 0.0;
+uniform float bloom_ghost_scale = 2.0;
+uniform float4 bloom_ghost_color = {1.0, 1.0, 1.0, 1.0};
+
+
+/** @brief Extract bright areas for bloom */
+float4 PSBloomExtract(VertData v_in) : TARGET {
+    float4 color = image.Sample(textureSampler, v_in.uv);
+    float luma = dot(color.rgb, float3(0.299, 0.587, 0.114));
+
+    // Extract bright areas — guard degenerate smoothstep at softness=0
+    float brightness = max(0.0, luma - bloom_threshold);
+    float safe_softness = max(0.001, bloom_softness);
+    float mask = smoothstep(0.0, safe_softness, brightness);
+    // Keep a small contribution from any above-threshold energy so bloom
+    // does not collapse to a fully black extraction on ordinary footage.
+    mask = saturate(max(mask, brightness * 0.35));
+
+    float3 bright = color.rgb * mask;
+
+    if (bloom_highlights_only > 0.5) {
+        // Only keep very bright areas - apply steeper re-mask on top of threshold'd extraction
+        float hi_mask = smoothstep(0.0, safe_softness * 0.5 + 0.001,
+                                   max(0.0, luma - (bloom_threshold + 0.2)));
+        bright *= hi_mask;
+    }
+
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(bright, color.a);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+/** @brief Karis-weighted 13-tap bloom downsample.
+ *
+ * Alpha-Piscium's bloom pipeline uses a real mip-style downsample/upsample
+ * chain instead of repeatedly blurring the full-resolution image. This is an
+ * OBS-effect reimplementation of that mechanism (not copied shader code):
+ * wide taps collect energy efficiently and Karis weighting suppresses isolated
+ * hot pixels before they can smear across the pyramid.
+ */
+float3 BloomSampleImageBlack(float2 uv) {
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+        return float3(0.0, 0.0, 0.0);
+    return image.Sample(textureSampler, uv).rgb;
+}
+
+float3 BloomSampleBlurredBlack(float2 uv) {
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+        return float3(0.0, 0.0, 0.0);
+    return blurred_image.Sample(textureSampler, uv).rgb;
+}
+
+float4 BloomWeightedTap(float2 uv, float spatial_weight) {
+    float3 c = max(BloomSampleImageBlack(uv), 0.0);
+    float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
+    float weight = spatial_weight / (1.0 + luma);
+    return float4(c * weight, weight);
+}
+
+float4 PSBloomDownsample(VertData v_in) : TARGET {
+    float2 px = uv_pixel_interval.xy;
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+
+    sum += BloomWeightedTap(v_in.uv, 0.125);
+
+    sum += BloomWeightedTap(v_in.uv + float2(-2.0,  0.0) * px, 0.0625);
+    sum += BloomWeightedTap(v_in.uv + float2( 2.0,  0.0) * px, 0.0625);
+    sum += BloomWeightedTap(v_in.uv + float2( 0.0, -2.0) * px, 0.0625);
+    sum += BloomWeightedTap(v_in.uv + float2( 0.0,  2.0) * px, 0.0625);
+
+    sum += BloomWeightedTap(v_in.uv + float2(-2.0, -2.0) * px, 0.03125);
+    sum += BloomWeightedTap(v_in.uv + float2( 2.0, -2.0) * px, 0.03125);
+    sum += BloomWeightedTap(v_in.uv + float2(-2.0,  2.0) * px, 0.03125);
+    sum += BloomWeightedTap(v_in.uv + float2( 2.0,  2.0) * px, 0.03125);
+
+    sum += BloomWeightedTap(v_in.uv + float2(-1.0, -1.0) * px, 0.125);
+    sum += BloomWeightedTap(v_in.uv + float2( 1.0, -1.0) * px, 0.125);
+    sum += BloomWeightedTap(v_in.uv + float2(-1.0,  1.0) * px, 0.125);
+    sum += BloomWeightedTap(v_in.uv + float2( 1.0,  1.0) * px, 0.125);
+
+    return float4(sum.rgb / max(sum.a, 0.0001), 1.0);
+}
+
+/** @brief Tent upsample + additive reconstruction.
+ *
+ * image is the next larger pyramid level; blurred_image is the accumulated
+ * smaller level. Because adjacent levels are exactly 2x apart, two output
+ * texels equal one texel in blurred_image.
+ */
+float4 PSBloomUpsample(VertData v_in) : TARGET {
+    float3 base = image.Sample(textureSampler, v_in.uv).rgb;
+    float spread = lerp(0.75, 2.5, saturate(bloom_radius / 50.0));
+    float2 px = uv_pixel_interval.xy * (2.0 * spread);
+
+    float3 small = float3(0.0, 0.0, 0.0);
+    small += BloomSampleBlurredBlack(v_in.uv + float2(-1.0, -1.0) * px);
+    small += BloomSampleBlurredBlack(v_in.uv + float2( 1.0, -1.0) * px);
+    small += BloomSampleBlurredBlack(v_in.uv + float2(-1.0,  1.0) * px);
+    small += BloomSampleBlurredBlack(v_in.uv + float2( 1.0,  1.0) * px);
+    small += BloomSampleBlurredBlack(v_in.uv + float2( 0.0, -1.0) * px) * 2.0;
+    small += BloomSampleBlurredBlack(v_in.uv + float2(-1.0,  0.0) * px) * 2.0;
+    small += BloomSampleBlurredBlack(v_in.uv + float2( 1.0,  0.0) * px) * 2.0;
+    small += BloomSampleBlurredBlack(v_in.uv + float2( 0.0,  1.0) * px) * 2.0;
+    small += BloomSampleBlurredBlack(v_in.uv) * 4.0;
+    small *= 0.0625;
+
+    return float4(base + small, 1.0);
+}
+
+
+float BloomLensDirtPattern(float2 uv) {
+    // Lens contamination is fixed to the optical surface. Multiple scales
+    // represent different dirt/smudge sizes, not particles drifting in space.
+    float2 dirt_uv = uv * max(1.0, bloom_dust_scale);
+    float depth_layers = max(1.0, min(5.0, bloom_dust_depth_layers));
+    float dirt_total = 0.0;
+    float dirt_sum = 0.0;
+
+    dirt_total += noise_tex.Sample(noiseSampler, dirt_uv).x;
+    dirt_sum += 1.0;
+
+    if (depth_layers >= 2.0) {
+        dirt_total += noise_tex.Sample(noiseSampler,
+            dirt_uv * 1.73 + float2(0.37, 0.61)).x;
+        dirt_sum += 1.0;
+    }
+    if (depth_layers >= 3.0) {
+        dirt_total += noise_tex.Sample(noiseSampler,
+            dirt_uv * 3.14 + float2(0.91, 0.25)).x;
+        dirt_sum += 1.0;
+    }
+    if (depth_layers >= 4.0) {
+        dirt_total += noise_tex.Sample(noiseSampler,
+            dirt_uv * 5.27 + float2(0.13, 0.78)).x;
+        dirt_sum += 1.0;
+    }
+    if (depth_layers >= 4.5) {
+        dirt_total += noise_tex.Sample(noiseSampler,
+            dirt_uv * 9.11 + float2(0.44, 0.92)).x;
+        dirt_sum += 1.0;
+    }
+
+    return saturate(dirt_total / max(dirt_sum, 1.0));
+}
+
+/** @brief Blur and combine bloom */
+float4 PSBloomCombine(VertData v_in) : TARGET {
+    float4 original = image.Sample(textureSampler, v_in.uv);
+    float4 blurred = blurred_image.Sample(textureSampler, v_in.uv);
+
+    // Ambient glow term: the bloom glow is otherwise driven purely by the
+    // threshold-extracted bright pass, so Intensity / Color only ever changed
+    // highlights and looked inert on ordinary footage. This folds the full
+    // frame's luminance back in (scaled by Intensity/Color) so the combine-stage
+    // sliders visibly affect the whole image, not just clipped highlights.
+    float src_luma = dot(original.rgb, float3(0.299, 0.587, 0.114));
+    float3 ambient = original.rgb * src_luma * bloom_intensity * bloom_color.rgb * 0.15;
+
+    // --- Layer 1: Direct additive bloom glow (stronger) ---
+    float3 bloom_rgb = blurred.rgb * bloom_intensity * bloom_color.rgb;
+    float3 final_rgb = original.rgb + bloom_rgb + ambient;
+
+    // --- Layer 2: Lens contamination interacting with captured light ---
+    if (bloom_dust_amount > 0.0 || bloom_refract_amount > 0.0 || bloom_haze_amount > 0.0) {
+        float dirt = BloomLensDirtPattern(v_in.uv);
+        float contrast = max(0.01, bloom_dust_contrast);
+        float shaped_dirt = saturate((dirt - 0.5) * contrast + 0.5);
+
+        // Dirt is not a self-lit overlay. It becomes visible because the
+        // threshold-extracted bloom energy strikes/scatters through it.
+        float highlight_luma =
+            dot(blurred.rgb, float3(0.299, 0.587, 0.114));
+        float source_highlight = smoothstep(
+            max(0.0, bloom_threshold - max(0.02, bloom_softness * 0.25)),
+            min(1.0, bloom_threshold + max(0.04, bloom_softness)),
+            src_luma);
+        float light_energy = max(
+            source_highlight,
+            max(0.0, highlight_luma * bloom_intensity * 6.0));
+        float light_gate = saturate(light_energy * 2.0);
+        float3 incident_light = max(
+            bloom_rgb,
+            original.rgb * source_highlight * bloom_intensity * 0.75);
+
+        float dust_presence = smoothstep(0.24, 0.92, shaped_dirt);
+        float dust_scatter =
+            dust_presence * bloom_dust_amount * light_gate;
+
+        // Broad light scatter from grime/smudges. This vanishes when there is
+        // no captured highlight energy.
+        final_rgb += incident_light * dust_scatter * 0.95;
+        final_rgb +=
+            bloom_color.rgb * dust_scatter * light_gate * 0.08;
+
+        // Fine contamination can produce sharper glints when directly lit.
+        float fine_dirt = smoothstep(0.68, 0.96, shaped_dirt);
+        float glint =
+            fine_dirt * light_gate * light_gate *
+            bloom_dust_specular * bloom_dust_amount;
+        final_rgb +=
+            max(incident_light, bloom_color.rgb * light_gate * 0.20) *
+            glint * 0.65;
+
+        // A little light loss through dirty glass is plausible, but keep it
+        // highlight-gated so dark/ordinary regions do not reveal a pasted mask.
+        final_rgb *=
+            1.0 - saturate(dust_presence * bloom_dust_amount * light_gate * 0.10);
+
+        // Veiling glare is also driven by incident light, not generic fog.
+        float haze_mask = saturate(
+            bloom_haze_amount * light_gate * (0.30 + dirt * 0.70));
+        final_rgb += incident_light * haze_mask * 1.10;
+        final_rgb +=
+            bloom_color.rgb * light_gate * haze_mask * 0.08;
+
+        // Refraction follows the local slope of the contamination pattern,
+        // approximating an optical-surface normal instead of an arbitrary
+        // scalar-noise direction.
+        if (bloom_refract_amount > 0.0 && light_gate > 0.0) {
+            float2 grad_step = uv_pixel_interval.xy * 2.0;
+            float dirt_x = BloomLensDirtPattern(
+                v_in.uv + float2(grad_step.x, 0.0));
+            float dirt_y = BloomLensDirtPattern(
+                v_in.uv + float2(0.0, grad_step.y));
+            float2 dirt_gradient = float2(dirt_x - dirt, dirt_y - dirt);
+
+            if (bloom_anamorphic > 0.5)
+                dirt_gradient.y = 0.0;
+
+            float2 refract_dir =
+                dirt_gradient * uv_pixel_interval.xy *
+                bloom_refract_amount * bloom_refract_scale * 80.0;
+
+            float r = blurred_image.Sample(
+                textureSampler, v_in.uv + refract_dir * 1.4).r;
+            float g = blurred_image.Sample(
+                textureSampler, v_in.uv + refract_dir).g;
+            float b = blurred_image.Sample(
+                textureSampler, v_in.uv - refract_dir * 1.4).b;
+            float3 refracted_bloom = float3(r, g, b);
+
+            float sr = image.Sample(
+                textureSampler, v_in.uv + refract_dir * 1.4).r;
+            float sg = image.Sample(
+                textureSampler, v_in.uv + refract_dir).g;
+            float sb = image.Sample(
+                textureSampler, v_in.uv - refract_dir * 1.4).b;
+            float3 refracted_source =
+                float3(sr, sg, sb) * source_highlight;
+
+            float refract_response =
+                bloom_refract_amount * light_gate *
+                (0.25 + dust_presence * 0.75);
+            final_rgb +=
+                (refracted_bloom + refracted_source * 0.50) *
+                bloom_intensity * refract_response * 0.75;
+        }
+    }
+
+    // --- Layer 3: Ghost Reflections ---
+    if (bloom_ghost_amount > 0.001) {
+        float2 center_uv = v_in.uv - 0.5;
+        float dist = length(center_uv);
+        if (dist > 0.001) {
+            float2 norm_dir = center_uv / dist;
+            float2 ghost_uv = v_in.uv - norm_dir * bloom_ghost_scale * uv_pixel_interval.xy * 80.0;
+
+            if (ghost_uv.x > 0.0 && ghost_uv.x < 1.0 && ghost_uv.y > 0.0 && ghost_uv.y < 1.0) {
+                float r = blurred_image.Sample(textureSampler, ghost_uv + float2(1.4, 0.0) * uv_pixel_interval.xy * bloom_ghost_scale * 10.0).r;
+                float g = blurred_image.Sample(textureSampler, ghost_uv).g;
+                float b = blurred_image.Sample(textureSampler, ghost_uv - float2(1.4, 0.0) * uv_pixel_interval.xy * bloom_ghost_scale * 10.0).b;
+                float3 ghost = float3(r, g, b) * bloom_ghost_color.rgb * bloom_ghost_amount * 0.3;
+                final_rgb += ghost;
+            }
+        }
+    }
+
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(saturate(final_rgb), original.a);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+technique DrawBloomExtract {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSBloomExtract(v_in);
+    }
+}
+
+technique DrawBloomDownsample {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSBloomDownsample(v_in);
+    }
+}
+
+technique DrawBloomUpsample {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSBloomUpsample(v_in);
+    }
+}
+
+technique DrawBloomCombine {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSBloomCombine(v_in);
+    }
+}
+
+// =========================================================
+// 9. GRIT & NOISE
+// =========================================================
+uniform float grit_dust = 0.07;
+uniform float grit_scratches = 0.03;
+uniform float grit_noise = 0.12;
+uniform float grit_flares = 0.0;
+uniform float4 grit_color = {0.5333, 0.5333, 0.5333, 1.0};
+uniform float grit_brightness = 0.0;
+uniform float grit_contrast = 1.0;
+uniform float grit_saturation = 0.98;
+uniform float grit_opacity = 0.30;
+uniform float grit_instability = 0.10;
+uniform float grit_blend_mode = 3.0;
+uniform float grit_scratch_type = 1.0;
+uniform float grit_dust_size = 0.8;
+
+float3 PSGritBlend(float3 original_rgb, float3 grit_rgb, int blend_mode) {
+    if (blend_mode == 0) {
+        return original_rgb * grit_rgb;
+    }
+    if (blend_mode == 1) {
+        return 1.0 - (1.0 - original_rgb) * (1.0 - grit_rgb);
+    }
+
+    if (blend_mode == 2) {
+        float3 check = step(0.5, original_rgb);
+        return lerp(2.0 * original_rgb * grit_rgb,
+                    1.0 - 2.0 * (1.0 - original_rgb) * (1.0 - grit_rgb),
+                    check);
+    }
+
+    if (blend_mode == 3) {
+        float3 low = original_rgb - (1.0 - 2.0 * grit_rgb) * original_rgb * (1.0 - original_rgb);
+        float3 high = original_rgb + (2.0 * grit_rgb - 1.0) * (sqrt(saturate(original_rgb)) - original_rgb);
+        return lerp(low, high, step(0.5, grit_rgb));
+    }
+
+    if (blend_mode == 4) {
+        return max(original_rgb, grit_rgb);
+    }
+
+    float3 check = step(0.5, grit_rgb);
+    return lerp(2.0 * original_rgb * grit_rgb,
+                1.0 - 2.0 * (1.0 - original_rgb) * (1.0 - grit_rgb),
+                check);
+}
+
+float4 PSGrit(VertData v_in) : TARGET {
+    float4 original = image.Sample(textureSampler, v_in.uv);
+    float2 uv = v_in.uv;
+
+    // Instability
+    if (grit_instability > 0.0) {
+        float t = floor(elapsed_time * 12.0);
+        uv.x += (emu_rand(float2(t, 1.1)) - 0.5) * 0.002 * grit_instability;
+        uv.y += (emu_rand(float2(t, 2.2)) - 0.5) * 0.002 * grit_instability;
+    }
+
+    float3 base = image.Sample(textureSampler, uv).rgb;
+    float t_grit = floor(elapsed_time * 18.0);
+
+    float noise = snoise(uv * 200.0 + t_grit);
+    float3 grit_layer = float3(0,0,0);
+
+    // Dust
+    if (grit_dust > 0.0) {
+        float d = snoise(uv * (5.0 / max(0.1, grit_dust_size)) + t_grit);
+        if (d > 1.0 - grit_dust * 0.1) grit_layer += grit_color.rgb * 0.5;
+    }
+
+    // Scratches
+    if (grit_scratches > 0.0) {
+        float s = 0.0;
+        int s_type = f2i(grit_scratch_type);
+        if (s_type == 0) { // Horizontal-ish
+            s = snoise(float2(uv.x * 50.0, uv.y * 0.1) + t_grit);
+        } else if (s_type == 1) { // Vertical-ish
+            s = snoise(float2(uv.x * 0.1, uv.y * 50.0) + t_grit);
+        } else { // Both
+            s = max(snoise(float2(uv.x * 50.0, uv.y * 0.1) + t_grit),
+                    snoise(float2(uv.x * 0.1, uv.y * 50.0) + t_grit + 0.5));
+        }
+
+        if (s > 1.0 - grit_scratches * 0.05) grit_layer += grit_color.rgb;
+    }
+
+    float3 final_rgb = lerp(base, base + (noise * grit_noise * 0.2), grit_opacity);
+    final_rgb = lerp(final_rgb, final_rgb + grit_layer, grit_opacity);
+
+    // Flares
+    if (grit_flares > 0.0) {
+        float f = sin(elapsed_time * 2.0 + emu_rand(float2(t_grit, 0.0)) * 10.0) * 0.5 + 0.5;
+        final_rgb += grit_color.rgb * f * grit_flares * 0.3;
+    }
+
+    final_rgb += grit_brightness;
+    final_rgb = lerp(float3(0.5, 0.5, 0.5), final_rgb, grit_contrast);
+    float gray = dot(final_rgb, float3(0.299, 0.587, 0.114));
+    final_rgb = lerp(float3(gray, gray, gray), final_rgb, grit_saturation);
+    final_rgb = PSGritBlend(original.rgb, saturate(final_rgb), f2i(grit_blend_mode));
+
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(saturate(final_rgb), original.a);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+technique DrawGrit {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSGrit(v_in);
+    }
+}
+
+// =========================================================
+// 10. MIRAGE
+// =========================================================
+uniform float mir_count = 4.0;
+uniform float mir_radius = 0.035;
+uniform float mir_rotation = 0.0;
+uniform float mir_rot_speed = 0.0;
+uniform float mir_center_mask = 0.28;
+uniform float mir_parallel = 0.0;
+
+float2 MirageMirrorUV(float2 uv) {
+    // Triangle-wave reflection: identity inside [0,1], mirrored outside it.
+    // Large Mirage radii therefore keep sampling image content instead of
+    // dropping every out-of-bounds tap and blending entire regions to black.
+    float2 folded = frac(uv * 0.5) * 2.0;
+    return 1.0 - abs(folded - 1.0);
+}
+
+float4 PSMirage(VertData v_in) : TARGET {
+    float4 original = image.Sample(textureSampler, v_in.uv);
+    float2 center = float2(0.5, 0.5);
+    float mask = smoothstep(0.0, max(0.01, mir_center_mask), length(v_in.uv - center));
+
+    float4 accum = float4(0,0,0,0);
+    int count = f2i(clamp(mir_count, 1.0, 12.0));
+
+    for (int i = 0; i < 12; i++) {
+        if (i >= count) break;
+
+        float angle = (6.2831853 / float(count)) * float(i) + radians(mir_rotation) + mir_rot_speed * elapsed_time * 0.1;
+        float2 offset = float2(cos(angle), sin(angle)) * mir_radius * mask;
+
+        if (mir_parallel > 0.5) {
+            float scroll = mir_rot_speed * elapsed_time * 0.1;
+            offset = float2(float(i) - float(count)/2.0 + scroll, 0.0) * mir_radius * mask;
+        }
+
+        float2 samp_uv = MirageMirrorUV(v_in.uv + offset);
+        accum += image.Sample(textureSampler, samp_uv);
+    }
+
+    float sample_count = max(1.0, float(count));
+    float3 result = lerp(original.rgb, accum.rgb / sample_count, mask);
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(result, original.a);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+technique DrawMirage {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSMirage(v_in);
+    }
+}
+
+// =========================================================
+// 11. CENTER SPOT
+// =========================================================
+uniform float spot_radius = 0.50;
+uniform float spot_softness = 0.28;
+uniform float spot_zoom_strength = 0.015;
+uniform float spot_blur_amount = 0.35;
+uniform float spot_blur_radius = 2.2;
+uniform float4 spot_tint = {1.0, 1.0, 1.0, 1.0};
+uniform float spot_blend_mode = 2.0;
+
+float4 PSCenterSpotBlur(float2 uv, float blur_scale) {
+    float2 blur_uv = uv_pixel_interval.xy * blur_scale;
+    float4 color = image.Sample(textureSampler, uv) * 0.2;
+    color += image.Sample(textureSampler, uv + float2( blur_uv.x, 0.0)) * 0.12;
+    color += image.Sample(textureSampler, uv + float2(-blur_uv.x, 0.0)) * 0.12;
+    color += image.Sample(textureSampler, uv + float2(0.0,  blur_uv.y)) * 0.12;
+    color += image.Sample(textureSampler, uv + float2(0.0, -blur_uv.y)) * 0.12;
+    color += image.Sample(textureSampler, uv + float2( blur_uv.x,  blur_uv.y)) * 0.08;
+    color += image.Sample(textureSampler, uv + float2(-blur_uv.x,  blur_uv.y)) * 0.08;
+    color += image.Sample(textureSampler, uv + float2( blur_uv.x, -blur_uv.y)) * 0.08;
+    color += image.Sample(textureSampler, uv + float2(-blur_uv.x, -blur_uv.y)) * 0.08;
+    return color;
+}
+
+float4 PSCenterSpotRadialZoom(float2 uv, float2 center, float amount) {
+    float2 dir = uv - center;
+    float4 color = image.Sample(textureSampler, uv) * 0.28;
+    float weight_sum = 0.28;
+
+    for (int i = 1; i <= 6; i++) {
+        float t = float(i) / 6.0;
+        float weight = 0.16 * (1.0 - t * 0.55);
+        float2 samp_uv = saturate(uv + dir * amount * t * 0.65);
+        color += image.Sample(textureSampler, samp_uv) * weight;
+        weight_sum += weight;
+    }
+
+    return color / weight_sum;
+}
+
+float4 PSCenterSpot(VertData v_in) : TARGET {
+    float4 original = image.Sample(textureSampler, v_in.uv);
+    float2 center = float2(0.5, 0.5);
+    float dist = length(v_in.uv - center);
+
+    // Physical center-spot filters have a genuinely clear center. The mask
+    // only introduces the optical outer ring.
+    float mask = smoothstep(spot_radius, spot_radius + spot_softness, dist);
+    int optic = f2i(spot_blend_mode);
+
+    float3 edge_rgb = original.rgb;
+
+    if (optic == 0) {
+        // Soft-spot / diffusion ring.
+        float4 diffused = PSCenterSpotBlur(v_in.uv, max(0.5, spot_blur_radius));
+        edge_rgb = lerp(original.rgb, diffused.rgb, saturate(spot_blur_amount));
+    } else if (optic == 1) {
+        // Diopter-style outer ring: stronger defocus with a relatively clear
+        // transition. A low softness value can intentionally reveal the ring.
+        float diopter_radius =
+            max(0.75, spot_blur_radius * (1.25 + spot_blur_amount * 0.75));
+        float4 defocused = PSCenterSpotBlur(v_in.uv, diopter_radius);
+        float diopter_mix = saturate(0.40 + spot_blur_amount * 0.60);
+        edge_rgb = lerp(original.rgb, defocused.rgb, diopter_mix);
+    } else {
+        // Radial-zoom glass: the small clear spot remains untouched while the
+        // outer annulus stretches detail radially. Blur is only supporting.
+        float4 zoomed =
+            PSCenterSpotRadialZoom(v_in.uv, center, spot_zoom_strength * mask);
+        float4 softened =
+            PSCenterSpotBlur(v_in.uv, max(0.5, spot_blur_radius));
+        edge_rgb =
+            lerp(zoomed.rgb, softened.rgb, saturate(spot_blur_amount * 0.35));
+    }
+
+    float3 final_rgb = lerp(original.rgb, edge_rgb, mask);
+
+    float3 guard = ForceUniformUsageRGB();
+    return float4(final_rgb + guard, original.a);
+}
+
+technique DrawCenterSpot {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSCenterSpot(v_in);
+    }
+}
+
+// =========================================================
+// 12. PINHOLE
+// =========================================================
+uniform float pinhole_softness = 0.22;
+uniform float pinhole_vignette = 0.14;
+uniform float pinhole_distortion = 0.0;
+uniform float pinhole_sepia = 0.02;
+uniform float pinhole_grain = 0.08;
+
+float4 PSPinhole(VertData v_in) : TARGET {
+    float2 centered_uv = v_in.uv - 0.5;
+    float aspect = (uv_pixel_interval.x != 0.0) ?
+                   (uv_pixel_interval.y / uv_pixel_interval.x) : 1.0;
+    float2 physical_uv = float2(centered_uv.x * aspect, centered_uv.y);
+    float focal_length = lerp(2.5, 0.55, pinhole_vignette);
+    float theta = atan(length(physical_uv) / focal_length);
+    float cos4_falloff = pow(cos(theta), 4.0);
+
+    float2 uv = v_in.uv;
+    // Saturated sample coordinates already prevent texture-edge artifacts.
+    // Do not multiply by a synthetic black border here; a pinhole's natural
+    // edge darkening is modeled by the cos^4 falloff below.
+    float diffraction_scale = 1.0 + pinhole_softness * 8.0;
+    float airy_radius_red = diffraction_scale * 1.22 * 650.0 / 532.0;
+    float airy_radius_green = diffraction_scale * 1.22;
+    float airy_radius_blue = diffraction_scale * 1.22 * 450.0 / 532.0;
+    float2 airy_red = uv_pixel_interval.xy * airy_radius_red;
+    float2 airy_green = uv_pixel_interval.xy * airy_radius_green;
+    float2 airy_blue = uv_pixel_interval.xy * airy_radius_blue;
+
+    float3 center = image.Sample(textureSampler, uv).rgb;
+    float red = center.r * 0.62;
+    red += image.Sample(textureSampler, saturate(uv + float2( airy_red.x, 0.0))).r * 0.075;
+    red += image.Sample(textureSampler, saturate(uv + float2(-airy_red.x, 0.0))).r * 0.075;
+    red += image.Sample(textureSampler, saturate(uv + float2(0.0,  airy_red.y))).r * 0.075;
+    red += image.Sample(textureSampler, saturate(uv + float2(0.0, -airy_red.y))).r * 0.075;
+    red += image.Sample(textureSampler, saturate(uv + float2( airy_red.x,  airy_red.y) * 1.8)).r * 0.025;
+    red += image.Sample(textureSampler, saturate(uv + float2(-airy_red.x,  airy_red.y) * 1.8)).r * 0.025;
+    red += image.Sample(textureSampler, saturate(uv + float2( airy_red.x, -airy_red.y) * 1.8)).r * 0.025;
+    red += image.Sample(textureSampler, saturate(uv + float2(-airy_red.x, -airy_red.y) * 1.8)).r * 0.025;
+
+    float green = center.g * 0.62;
+    green += image.Sample(textureSampler, saturate(uv + float2( airy_green.x, 0.0))).g * 0.075;
+    green += image.Sample(textureSampler, saturate(uv + float2(-airy_green.x, 0.0))).g * 0.075;
+    green += image.Sample(textureSampler, saturate(uv + float2(0.0,  airy_green.y))).g * 0.075;
+    green += image.Sample(textureSampler, saturate(uv + float2(0.0, -airy_green.y))).g * 0.075;
+    green += image.Sample(textureSampler, saturate(uv + float2( airy_green.x,  airy_green.y) * 1.8)).g * 0.025;
+    green += image.Sample(textureSampler, saturate(uv + float2(-airy_green.x,  airy_green.y) * 1.8)).g * 0.025;
+    green += image.Sample(textureSampler, saturate(uv + float2( airy_green.x, -airy_green.y) * 1.8)).g * 0.025;
+    green += image.Sample(textureSampler, saturate(uv + float2(-airy_green.x, -airy_green.y) * 1.8)).g * 0.025;
+
+    float blue = center.b * 0.62;
+    blue += image.Sample(textureSampler, saturate(uv + float2( airy_blue.x, 0.0))).b * 0.075;
+    blue += image.Sample(textureSampler, saturate(uv + float2(-airy_blue.x, 0.0))).b * 0.075;
+    blue += image.Sample(textureSampler, saturate(uv + float2(0.0,  airy_blue.y))).b * 0.075;
+    blue += image.Sample(textureSampler, saturate(uv + float2(0.0, -airy_blue.y))).b * 0.075;
+    blue += image.Sample(textureSampler, saturate(uv + float2( airy_blue.x,  airy_blue.y) * 1.8)).b * 0.025;
+    blue += image.Sample(textureSampler, saturate(uv + float2(-airy_blue.x,  airy_blue.y) * 1.8)).b * 0.025;
+    blue += image.Sample(textureSampler, saturate(uv + float2( airy_blue.x, -airy_blue.y) * 1.8)).b * 0.025;
+    blue += image.Sample(textureSampler, saturate(uv + float2(-airy_blue.x, -airy_blue.y) * 1.8)).b * 0.025;
+
+    float3 airy_col = float3(red, green, blue) * cos4_falloff;
+
+    // Sepia
+    float gray = dot(airy_col, float3(0.299, 0.587, 0.114));
+    float3 sepia_col = float3(gray * 1.2, gray * 0.9, gray * 0.7);
+    float3 col = lerp(airy_col, sepia_col, pinhole_sepia);
+
+    // Grain
+    float noise = snoise(uv * 400.0 + elapsed_time * 10.0);
+    col += noise * pinhole_grain * 0.15;
+
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(saturate(col), 1.0);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+technique DrawPinhole {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSPinhole(v_in);
+    }
+}
+
+// =========================================================
+// 13. POLAROID
+// =========================================================
+uniform float polaroid_softness = 0.18;
+uniform float polaroid_vignette = 0.12;
+uniform float polaroid_color_shift = 0.55;
+uniform float polaroid_contrast = 1.06;
+uniform float polaroid_grain = 0.12;
+uniform float polaroid_develop = 1.0;
+uniform float polaroid_develop_center = 0.5;
+uniform float4 polaroid_base_color = {0.8784, 0.8588, 0.8000, 1.0};
+uniform float polaroid_bleed = 0.03;
+
+float4 PSPolaroid(VertData v_in) : TARGET {
+    float2 uv = v_in.uv;
+
+    // Softness
+    float2 texel = uv_pixel_interval.xy * (1.0 + polaroid_softness * 2.0);
+    float3 col = image.Sample(textureSampler, uv).rgb * 0.5;
+    col += image.Sample(textureSampler, uv + float2(texel.x, texel.y)).rgb * 0.125;
+    col += image.Sample(textureSampler, uv - float2(texel.x, texel.y)).rgb * 0.125;
+    col += image.Sample(textureSampler, uv + float2(-texel.x, texel.y)).rgb * 0.125;
+    col += image.Sample(textureSampler, uv + float2(texel.x, -texel.y)).rgb * 0.125;
+
+    // Contrast & Lifted Blacks
+    col = (col - 0.5) * polaroid_contrast + 0.5;
+    col = max(col, float3(0.05, 0.05, 0.05)); // Lift blacks
+
+    // Development emergence — image emerges from silvery base, center first
+    if (polaroid_develop < 1.0) {
+        float2 center_dist = uv - 0.5;
+        float radial = 1.0 - saturate(length(center_dist) * 2.0 * (1.0 - polaroid_develop_center));
+        float local_develop = saturate(polaroid_develop + radial * 0.35 - 0.1);
+        col = lerp(polaroid_base_color.rgb, col, local_develop);
+        // Undeveloped areas desaturate
+        float col_luma = dot(col, float3(0.299, 0.587, 0.114));
+        col = lerp(float3(col_luma, col_luma, col_luma), col, local_develop * 0.7 + 0.3);
+    }
+
+    // Polaroid dye-layer color grade (3-zone split tone)
+    if (polaroid_color_shift > 0.0) {
+        float luma = dot(col, float3(0.299, 0.587, 0.114));
+        // Shadows: warm amber push
+        float shadow_mask = saturate(1.0 - luma * 2.5);
+        col += float3(0.06, 0.03, -0.04) * shadow_mask * polaroid_color_shift;
+        // Midtones: acid-green/yellow bias (Polaroid signature)
+        float mid_mask = saturate(1.0 - abs(luma - 0.45) * 4.0);
+        col += float3(-0.02, 0.05, -0.03) * mid_mask * polaroid_color_shift;
+        // Highlights: slight cyan rolloff
+        float hi_mask = saturate((luma - 0.65) * 3.0);
+        col += float3(-0.03, -0.01, 0.04) * hi_mask * polaroid_color_shift;
+    }
+
+    // Vignette
+    float vig = 1.0 - smoothstep(0.2, 1.0, length(uv - 0.5) * (1.0 + polaroid_vignette));
+    col *= lerp(1.0, vig, polaroid_vignette);
+
+    // Chemical edge bleed (uneven development border)
+    if (polaroid_bleed > 0.0) {
+        float edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+        float edge_mask = 1.0 - smoothstep(0.0, 0.12, edge);
+        float bleed_noise = snoise(uv * 8.0) * 0.5 + 0.5;
+        float bleed_val = edge_mask * (0.6 + bleed_noise * 0.4) * polaroid_bleed;
+        float3 bleed_col = float3(0.92, 0.88, 0.80);
+        col = lerp(col, bleed_col, saturate(bleed_val * 0.7));
+    }
+
+    // Grain — heavier at edges, coarser clumping
+    float noise_fine = snoise(uv * 300.0 + elapsed_time * 15.0);
+    float noise_coarse = snoise(uv * 80.0 + elapsed_time * 3.0);
+    float edge_dist = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    float grain_weight = lerp(1.5, 0.6, smoothstep(0.0, 0.2, edge_dist));
+    col += (noise_fine * 0.7 + noise_coarse * 0.3) * polaroid_grain * 0.1 * grain_weight;
+
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(saturate(col), 1.0);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+technique DrawPolaroid {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSPolaroid(v_in);
+    }
+}
+
+// =========================================================
+// 14. DAGUERREOTYPE
+// =========================================================
+uniform float dag_contrast = 0.38;
+uniform float dag_grain = 0.16;
+uniform float dag_tint = 0.72;
+uniform float dag_vignette = 0.18;
+uniform float dag_edge_blur = 0.18;
+
+float4 PSDaguerreotype(VertData v_in) : TARGET {
+    float2 uv = v_in.uv;
+    float dist = length(uv - 0.5);
+
+    // Edge Blur
+    float blur_mask = smoothstep(0.2, 0.7, dist) * dag_edge_blur;
+    float2 texel = uv_pixel_interval.xy * 3.0 * blur_mask;
+    float3 col;
+    if (blur_mask > 0.01) {
+        col = image.Sample(textureSampler, uv).rgb * 0.5;
+        col += image.Sample(textureSampler, uv + float2(texel.x, texel.y)).rgb * 0.125;
+        col += image.Sample(textureSampler, uv - float2(texel.x, texel.y)).rgb * 0.125;
+        col += image.Sample(textureSampler, uv + float2(-texel.x, texel.y)).rgb * 0.125;
+        col += image.Sample(textureSampler, uv + float2(texel.x, -texel.y)).rgb * 0.125;
+    } else {
+        col = image.Sample(textureSampler, uv).rgb;
+    }
+
+    // High Contrast Metallic Monochome
+    float luma = dot(col, float3(0.299, 0.587, 0.114));
+    luma = (luma - 0.5) * (1.0 + dag_contrast * 2.0) + 0.5;
+    luma = saturate(luma);
+
+    // Silver Tint
+    float3 silver = float3(0.9, 0.95, 1.0); // cool metallic highlight
+    float3 tarnish = float3(0.3, 0.25, 0.2); // warm shadow
+    float3 tinted = lerp(tarnish, silver, luma);
+    col = lerp(float3(luma, luma, luma), tinted, dag_tint);
+
+    // Vignette
+    float vig = 1.0 - smoothstep(0.1, 0.9, dist * (1.0 + dag_vignette * 1.5));
+    col *= lerp(1.0, vig, dag_vignette);
+
+    // Heavy Grain
+    float noise = snoise(uv * 600.0 + elapsed_time * 20.0);
+    col += noise * dag_grain * 0.2;
+
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(saturate(col), 1.0);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+technique DrawDaguerreotype {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSDaguerreotype(v_in);
+    }
+}
+
+// =========================================================
+// 15. TECHNICOLOR 2-STRIP
+// =========================================================
+uniform float tech_strength = 0.72;
+uniform float tech_saturation = 1.06;
+uniform float tech_offset = 0.02;
+uniform float tech_glow = 0.08;
+
+float4 PSTechnicolor(VertData v_in) : TARGET {
+    float2 uv = v_in.uv;
+
+    // Color Split Offset (misaligned physical film strips)
+    float2 offset = float2(tech_offset * 3.0 * uv_pixel_interval.x, 0.0);
+    float3 col_center = image.Sample(textureSampler, uv).rgb;
+    float3 col_red = image.Sample(textureSampler, uv + offset).rgb;
+    float3 col_cyan = image.Sample(textureSampler, uv - offset).rgb;
+
+    // Simulate the Red and Cyan filter passes
+    float red_record = col_red.r;
+    float cyan_record = (col_cyan.g + col_cyan.b) * 0.5;
+
+    // Output matrix for 2-Strip (Red and Blue-Green)
+    float3 tech_col;
+    tech_col.r = red_record;
+    tech_col.g = cyan_record;
+    tech_col.b = cyan_record * 0.9; // Slightly less blue for typical warm skin tones
+
+    // Mix strength
+    float3 col = lerp(col_center, tech_col, tech_strength);
+
+    // Saturation
+    float luma = dot(col, float3(0.299, 0.587, 0.114));
+    col = lerp(float3(luma, luma, luma), col, tech_saturation);
+
+    // Highlight Glow (Dye spread)
+    if (tech_glow > 0.0) {
+        float2 texel = uv_pixel_interval.xy * 2.0;
+        float3 blur = col_center * 0.5;
+        blur += image.Sample(textureSampler, uv + float2(texel.x, texel.y)).rgb * 0.125;
+        blur += image.Sample(textureSampler, uv - float2(texel.x, texel.y)).rgb * 0.125;
+        blur += image.Sample(textureSampler, uv + float2(-texel.x, texel.y)).rgb * 0.125;
+        blur += image.Sample(textureSampler, uv + float2(texel.x, -texel.y)).rgb * 0.125;
+
+        float blur_luma = dot(blur, float3(0.299, 0.587, 0.114));
+        float glow_mask = smoothstep(0.5, 1.0, blur_luma);
+        col += blur * glow_mask * tech_glow;
+    }
+
+    float3 guard = ForceUniformUsageRGB();
+    float4 ret = float4(saturate(col), 1.0);
+    return float4(ret.rgb + guard, ret.a);
+}
+
+technique DrawTechnicolor {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSTechnicolor(v_in);
+    }
+}
+
+// =========================================================
+// WET LENS — stationary curved water on optical glass
+// =========================================================
+// Separate from dust: wet beads have a finite lens profile, bend the actual
+// captured scene, and create light-dependent Fresnel-like rims. No sprite/PNG.
+uniform float wet_density = 0.58;
+uniform float wet_size = 0.86;
+uniform float wet_refraction = 0.65;
+uniform float wet_glint = 0.65;
+uniform float wet_stretch = 0.24;
+uniform float wet_chromatic = 0.16;
+uniform float wet_seed = 11.0;
+
+// Stable cell-space hash: unlike noise_tex, this has no per-instance state.
+// Recreating a filter with the same saved seed preserves its water pattern.
+float WetCellRandom(float2 cell, float seed) {
+    float3 p = frac(float3(cell.x, cell.y, seed) *
+                    float3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yzx + 33.33);
+    return frac((p.x + p.y) * p.z);
+}
+
+float4 PSWetLens(VertData v_in) : TARGET {
+    float2 uv = v_in.uv;
+    float4 source = image.Sample(textureSampler, uv);
+    if (wet_density <= 0.0001)
+        return source;
+
+    // Screen-space optics: droplets stay affixed to glass, even as the
+    // background moves. Aspect correction prevents horizontally oval beads.
+    float aspect = uv_pixel_interval.y / max(0.000001, uv_pixel_interval.x);
+    float2 cells = float2(10.0 * aspect, 10.0);
+    float2 coords = uv * cells;
+    float2 base_cell = floor(coords);
+
+    float strongest = 0.0;
+    float2 selected_normal = float2(0.0, 0.0);
+    float selected_radius = 0.0;
+    float selected_rim = 0.0;
+
+    // Maximal beads can extend into cells two rows or columns away.
+    // Search a 5x5 neighborhood so their contours never clip at grid seams.
+    // Hash each cell and persisted seed directly: no instance-random texture.
+    for (int cy = -2; cy <= 2; ++cy) {
+        for (int cx = -2; cx <= 2; ++cx) {
+            float2 cell = base_cell + float2(float(cx), float(cy));
+            // Whether a site is wet is independent from its droplet shape.
+            // Raising density reveals additional beads without moving or
+            // resizing existing ones.
+            float occupied = WetCellRandom(cell, wet_seed);
+            if (occupied > wet_density)
+                continue;
+            float jitter_x = WetCellRandom(cell + float2(19.7, 41.1),
+                                           wet_seed + 13.0);
+            float jitter_y = WetCellRandom(cell + float2(53.3, 11.9),
+                                           wet_seed + 37.0);
+            float size_roll = WetCellRandom(cell + float2(7.1, 89.3),
+                                            wet_seed + 61.0);
+            float2 center = cell + 0.18 +
+                            float2(jitter_x, jitter_y) * 0.64;
+            // Mostly pinprick beads, some larger pooled drops. Size is not
+            // coupled to the occupancy threshold or the position hash.
+            float radius = (0.13 + 0.45 * size_roll * size_roll) * wet_size;
+            float2 local = (coords - center) / max(0.05, radius);
+            // Gravity narrows the top shoulder and gathers water below it.
+            // Slight deterministic asymmetry avoids identical stamped ovals.
+            // These shapes are fixed to the glass, not animated fluid.
+            float gravity = wet_stretch * (0.28 + 0.58 * size_roll);
+            local.y /= 1.0 + gravity;
+            local.x += 0.045 * sin(local.y * 5.2 + jitter_y * 6.28);
+            local.x /= max(0.65, 1.0 + gravity * (0.72 * local.y - 0.24));
+            float radial = length(local);
+            float bead = 1.0 - smoothstep(0.80, 1.02, radial);
+            if (bead > strongest) {
+                strongest = bead;
+                // Approximate the gradient of a spherical-cap thickness
+                // profile; steeper at the rim, limited to avoid aliasing.
+                float slope = rsqrt(max(0.12, 1.0 - radial * radial));
+                selected_normal = local * min(slope, 2.4);
+                selected_radius = radius;
+                float annulus = smoothstep(0.68, 0.88, radial) *
+                               (1.0 - smoothstep(0.96, 1.09, radial));
+                float lit_side = saturate(
+                    0.35 + dot(normalize(local + float2(0.0001, 0.0001)),
+                               float2(-0.55, -0.84)) * 0.65);
+                selected_rim = annulus * lit_side;
+            }
+        }
+    }
+    if (strongest <= 0.0001)
+        return source;
+
+    // The bent ray reads the live image through the water, not an
+    // independent texture. Radius is converted from cell units to UV.
+    float2 radius_uv = selected_radius / cells;
+    float2 displacement = selected_normal * radius_uv *
+                          wet_refraction * 0.50 * strongest;
+    float2 view = saturate(uv - displacement);
+    float3 refracted = image.Sample(textureSampler, view).rgb;
+
+    // Spectral fringes are tiny and restricted to the refracting surface.
+    if (wet_chromatic > 0.0001) {
+        float2 dispersion = displacement * wet_chromatic * 0.19;
+        refracted.r = image.Sample(textureSampler,
+                                   saturate(view + dispersion)).r;
+        refracted.b = image.Sample(textureSampler,
+                                   saturate(view - dispersion)).b;
+    }
+
+    // Rim lighting is supplied by captured incident light, not an always-on
+    // white outline. Nearby pixel taps broaden distant lamp/window energy.
+    float2 px = uv_pixel_interval.xy * 4.0;
+    float3 nearby = (
+        image.Sample(textureSampler, saturate(view + float2(px.x, 0.0))).rgb +
+        image.Sample(textureSampler, saturate(view - float2(px.x, 0.0))).rgb +
+        image.Sample(textureSampler, saturate(view + float2(0.0, px.y))).rgb +
+        image.Sample(textureSampler, saturate(view - float2(0.0, px.y))).rgb
+    ) * 0.25;
+    float3 incident = max(refracted, nearby);
+    float luma = dot(incident, float3(0.299, 0.587, 0.114));
+    float captured_light = smoothstep(0.34, 0.92, luma);
+    float3 highlight = incident * (captured_light * selected_rim *
+                                  wet_glint * 0.65);
+
+    // Keep the unstained glass fully transparent to the original image.
+    // Do not change source alpha (OBS filter source compositing contract).
+    float3 result = lerp(source.rgb, refracted, strongest);
+    result += highlight * strongest;
+    return float4(saturate(result), source.a);
+}
+
+technique DrawWetLens {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader = PSWetLens(v_in);
+    }
+}
+
+// =========================================================
+// PHONE WET LENS — water on the compact camera's cover glass
+// =========================================================
+// Unlike macro shots of individual raindrops, this effect mimics broad,
+// defocused contamination on a near-lens surface: a few irregular meniscus
+// regions, refracted scene detail and light-dependent veiling/streaked flare.
+// This is an artistic approximation, not calibrated geometrical ray tracing.
+// Every emitted flare ray is sampled from the actual source image.
+uniform float phone_coverage = 0.48;
+uniform float phone_scale = 1.0;
+uniform float phone_refraction = 0.55;
+uniform float phone_ribbons = 0.45;
+uniform float phone_reach = 0.58;
+uniform float phone_glow = 0.24;
+uniform float phone_arcs = 0.38;
+uniform float phone_angle = 0.0;
+uniform float phone_seed = 19.0;
+
+float4 PSPhoneWet(VertData v_in) : TARGET {
+    float2 uv = v_in.uv;
+    float4 source = image.Sample(textureSampler, uv);
+    if (phone_coverage < 0.0001)
+        return source;
+
+    // Correct for actual pixel aspect so contours stay circular-ish.
+    // Two or three broad regions per screen axis (not an even droplet grid).
+    float aspect = uv_pixel_interval.y /
+                   max(0.000001, uv_pixel_interval.x);
+    float2 cell_scale = float2(2.6 * aspect, 2.6) /
+                        max(0.5, phone_scale);
+    float2 coord = uv * cell_scale;
+    float2 base_cell = floor(coord);
+    float wet = 0.0;
+    float rim = 0.0;
+    float2 normal = float2(0.0, 0.0);
+    float2 radius_uv = 1.0 / cell_scale;
+    float phase = phone_seed * 0.017;
+
+    // Candidate "water islands" are widely spaced, randomly displaced,
+    // differently sized and asymmetrically stretched. Neighbor search avoids
+    // hard cell seams, including close to image boundaries.
+    for (int cy = -1; cy <= 1; ++cy) {
+        for (int cx = -1; cx <= 1; ++cx) {
+            float2 cell = base_cell + float2(float(cx), float(cy));
+            float rv = WetCellRandom(cell + float2(17.0, 71.0),
+                                     phone_seed + 29.0);
+            if (rv > phone_coverage)
+                continue;
+            float r1 = frac(rv * 17.38 + phase * 3.1);
+            float r2 = frac(rv * 43.13 + phase * 4.7);
+            float r3 = frac(rv * 67.31 + phase * 5.5);
+            float2 center = cell + float2(0.18 + 0.64 * r1,
+                                          0.18 + 0.64 * r2);
+            float2 d = coord - center;
+            float size = 0.44 + 0.42 * r3;
+            d.x += 0.13 * sin(d.y * 3.8 + rv * 25.0);
+            d.y += 0.10 * sin(d.x * 4.2 + rv * 19.0);
+            float2 oval = d / float2(size * (0.83 + 0.45 * r1),
+                                     size * (0.83 + 0.57 * r2));
+            float radial = length(oval);
+            float interior = 1.0 - smoothstep(0.82, 1.15, radial);
+            float edge = smoothstep(0.71, 0.91, radial) *
+                         (1.0 - smoothstep(0.96, 1.14, radial));
+            // Preserve the strongest surface patch for ray displacement;
+            // multiple weaker overlapping rim contours still accumulate.
+            rim = max(rim, edge * (0.65 + 0.35 * r2));
+            if (interior > wet) {
+                wet = interior;
+                float slope = rsqrt(max(0.12, 1.0 - radial * radial));
+                normal = oval * min(2.2, slope) * (0.5 + 0.5 * r3);
+            }
+        }
+    }
+
+    // Avoid expensive scene taps on pixels untouched by optical material.
+    if (wet < 0.0001 && rim < 0.0001)
+        return source;
+
+    float2 bent = saturate(uv - normal * radius_uv *
+                          (0.026 * phone_refraction * wet));
+    float3 refracted = image.Sample(textureSampler, bent).rgb;
+    float3 result = lerp(source.rgb, refracted,
+                         wet * saturate(phone_refraction * 1.15));
+
+    // Meniscus edges are only visible when they collect light. An adjacent
+    // glass boundary gives a subtle dark edge; true light-energy pickup below
+    // forms the glowing ribbons from actual lamps, not white drawn lines.
+    float3 near1 = image.Sample(textureSampler,
+                     saturate(bent + float2(uv_pixel_interval.x * 7.0,
+                                            uv_pixel_interval.y * 4.0))).rgb;
+    float3 near2 = image.Sample(textureSampler,
+                     saturate(bent - float2(uv_pixel_interval.x * 7.0,
+                                            uv_pixel_interval.y * 4.0))).rgb;
+    float3 edge_illuminance = max(refracted, max(near1, near2));
+    float edge_luma = dot(edge_illuminance, float3(0.299, 0.587, 0.114));
+    float edge_light = smoothstep(0.37, 0.88, edge_luma);
+    float edge_amount = rim * phone_arcs * phone_coverage;
+    result += edge_illuminance * edge_light * edge_amount * 0.38;
+
+    // Near-lens menisci streak high-intensity points into curved ribbons.
+    // Fixed, bounded taps make cost deterministic on OBS. A rotated, slightly
+    // warped scan line gathers real scene brightness from both sides.
+    if (phone_ribbons > 0.0001 && phone_reach > 0.0001) {
+        float theta = radians(phone_angle);
+        float2 axis = float2(cos(theta), sin(theta));
+        float2 across = float2(-axis.y, axis.x);
+        float2 sweep = axis * phone_reach * 0.21;
+        float curve = sin(dot(uv, axis) * 19.0 + phase * 30.0) * 0.006 +
+                      sin(dot(uv, across) * 9.0 + phase * 16.0) * 0.003;
+        float3 spread = float3(0.0, 0.0, 0.0);
+        // Never synthesize a light that does not already exist in the scene.
+        for (int i = -5; i <= 5; ++i) {
+            float t = float(i) / 5.0;
+            float2 pt = saturate(uv + sweep * t +
+                        across * (curve * (1.0 - t * t) +
+                                  t * 0.012 * rim));
+            float3 photon = image.Sample(textureSampler, pt).rgb;
+            float bright = dot(photon, float3(0.299, 0.587, 0.114));
+            float gate = smoothstep(0.58, 0.91, bright);
+            float weight = exp(-2.25 * t * t);
+            spread += photon * gate * weight;
+        }
+        // Average energy, rather than multiplying by the sample count.
+        // Arc outlines seed the long streaks; large water areas contribute
+        // a weaker veiling tail even when an edge is out of focus.
+        float surface = saturate(rim * 1.7 + wet * 0.27) *
+                        phone_coverage;
+        result += spread * (phone_ribbons * 0.20 / 7.0) * surface;
+    }
+
+    if (phone_glow > 0.0001) {
+        float2 glow_offset = uv_pixel_interval.xy * 14.0;
+        float3 glow = (
+            image.Sample(textureSampler,
+                saturate(bent + glow_offset)).rgb +
+            image.Sample(textureSampler,
+                saturate(bent - glow_offset)).rgb +
+            image.Sample(textureSampler,
+                saturate(bent + float2(-glow_offset.x, glow_offset.y))).rgb +
+            image.Sample(textureSampler,
+                saturate(bent + float2(glow_offset.x, -glow_offset.y))).rgb
+        ) * 0.25;
+        float brightness = dot(glow, float3(0.299, 0.587, 0.114));
+        float active_water = saturate(wet * 0.65 + rim * 0.9);
+        result += glow * smoothstep(0.48, 0.88, brightness) *
+                  phone_glow * active_water * phone_coverage * 0.26;
+    }
+
+    return float4(saturate(result), source.a);
+}
+
+technique DrawPhoneWet {
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader = PSPhoneWet(v_in);
+    }
+}

@@ -1,0 +1,175 @@
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Format check
+    runs-on: ubuntu-24.04
+    steps:
+      # check-changes compares with origin/main; the default shallow checkout
+      # of a PR merge SHA does not contain that remote ref.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-clang-format
+      - uses: ./.github/actions/run-gersemi
+
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify deterministic Linux OBS SDK
+        run: python3 tests/test_ci_sdk_contract.py
+      - name: Run Python tests
+        run: python3 tests/test_shader_syntax.py
+      - name: Run render pipeline tests
+        run: python3 tests/test_render_pipeline.py
+      - name: Run GPU resource tests
+        run: python3 tests/test_gpu_resources.py
+      - name: Verify installer rollback and preservation
+        run: python3 -m unittest discover -s tests -p test_safe_installer.py -v
+
+  build-linux:
+    name: Linux build and native tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build plugin
+        uses: ./.github/actions/build-plugin
+        with:
+          target: x86_64
+
+      - name: Configure real plugin and native tests
+        # Reuse the exact pinned OBS SDK built above; do not fall back to a
+        # runner-provided libobs package for the native/GPU tests.
+        run: >-
+          cmake -S . -B tests/build
+          -DENABLE_TESTING=ON
+          -Dlibobs_DIR="$GITHUB_WORKSPACE/.deps/lib/cmake/libobs"
+
+      - name: Build real plugin and native tests
+        run: cmake --build tests/build --parallel
+
+      - name: Verify development rundir excludes agent guidance
+        run: |
+          test -d tests/build/rundir
+          if find tests/build/rundir -type f -name AGENTS.md | grep .; then
+            echo '::error::Development-only AGENTS.md leaked into Linux rundir'
+            exit 1
+          fi
+
+      # Root CMake adds the test suite inside the nested tests/ build folder.
+      # A CTest invocation against tests/build silently reports no tests!
+      - name: Run actual CTest suite (including GPU pixel tests)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/.deps/lib
+        run: |
+          listed=$(ctest --test-dir tests/build/tests -N)
+          printf '%s\n' "$listed" | grep -F 'WetLensGpuRenderTest' > /dev/null
+          printf '%s\n' "$listed" | grep -F 'PhoneWetGpuRenderTest' > /dev/null
+          printf '%s\n' "$listed" | grep -F 'MemLeakTest' > /dev/null
+          ctest --test-dir tests/build/tests --output-on-failure
+
+      - name: Validate staged Linux runtime payload
+        run: |
+          cmake --install build_x86_64 --prefix "$RUNNER_TEMP/emulensfx-staging"
+          module=$(find "$RUNNER_TEMP/emulensfx-staging/lib" -type f -path '*/obs-plugins/emuLensFX.so' -print -quit)
+          test -n "$module" && test -s "$module"
+          test -s "$RUNNER_TEMP/emulensfx-staging/share/obs/obs-plugins/emuLensFX/emulens.effect"
+          if find "$RUNNER_TEMP/emulensfx-staging" -name AGENTS.md | grep .; then
+            echo '::error::Source-only agent guidance leaked into installed package'
+            exit 1
+          fi
+
+      - name: Seed private-state source packaging canaries
+        run: |
+          mkdir -p .meristem/local .deps/fixture build/fixture tests/build/fixture
+          printf 'SYNTHETIC_NOT_PRIVATE\n' > .meristem/local/.source-privacy-canary
+          printf 'SYNTHETIC_NOT_PRIVATE\n' > .deps/fixture/asset
+          printf 'SYNTHETIC_NOT_PRIVATE\n' > build/fixture/asset
+          printf 'SYNTHETIC_NOT_PRIVATE\n' > tests/build/fixture/asset
+
+      - name: Verify CPack source privacy before uploading
+        run: |
+          cmake --build build_x86_64 --target package_source
+          archive=$(find release -maxdepth 1 -name '*-source.tar.xz' -print -quit)
+          test -n "$archive" && test -s "$archive"
+          test -f .meristem/local/.source-privacy-canary
+          python3 tests/check_source_archive.py "$archive"
+          sha256sum "$archive"
+
+      - name: Upload verified Linux runtime and source
+        uses: actions/upload-artifact@v6
+        with:
+          name: emulensfx-linux-obs32
+          path: |
+            ${{ runner.temp }}/emulensfx-staging/
+            release/*-source.tar.xz
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows OBS32 build and package
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and install to release staging
+        uses: ./.github/actions/build-plugin
+        with:
+          target: x64
+      - name: Verify Windows plugin distribution
+        shell: pwsh
+        run: |
+          $modern = 'release/RelWithDebInfo/emuLensFX/emuLensFX.dll'
+          $legacy = 'release/RelWithDebInfo/emuLensFX/bin/64bit/emuLensFX.dll'
+          if (-not (Test-Path $modern)) { throw 'Missing OBS 33 modern-layout emuLensFX.dll' }
+          if (-not (Test-Path $legacy)) { throw 'Missing legacy-layout emuLensFX.dll' }
+          $effects = @(Get-ChildItem -Path release -Recurse -Filter 'emulens.effect' -File)
+          if ($effects.Count -lt 1) { throw 'Missing installed OBS effect resource' }
+          $agentFiles = @(Get-ChildItem -Path release -Recurse -Filter AGENTS.md -File)
+          if ($agentFiles.Count -ne 0) { throw 'Development-only agent files leaked into Windows distribution' }
+      - uses: actions/upload-artifact@v6
+        with:
+          name: emulensfx-windows-obs32
+          path: release/RelWithDebInfo/
+          if-no-files-found: error
+
+  build-macos:
+    name: macOS OBS32 bundle and package
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and install unsigned bundle to release staging
+        uses: ./.github/actions/build-plugin
+        with:
+          target: universal
+      - name: Verify macOS plugin distribution
+        shell: bash
+        run: |
+          bundle=$(find release -name 'emuLensFX.plugin' -type d -print -quit)
+          test -n "$bundle"
+          test -s "$bundle/Contents/MacOS/emuLensFX"
+          test -s "$bundle/Contents/Resources/emulens.effect"
+          if find "$bundle" -name AGENTS.md | grep .; then
+            echo '::error::Source-only agent guidance leaked into macOS bundle'
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v6
+        with:
+          name: emulensfx-macos-obs32
+          path: release/RelWithDebInfo/
+          if-no-files-found: error
